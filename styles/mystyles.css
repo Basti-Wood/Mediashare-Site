@@ -1,22 +1,680 @@
-input {
-    border: none; /* Remove the weird border */
-    outline: none; /* Remove the default focus outline */
-    width: 100%; /* Increase the width of input boxes */
-    padding: 12px 20px;
-    margin: 8px 0;
+* {
     box-sizing: border-box;
-    background-color: #4a0c96;
-	color: white;
-	border-radius: 10px;
-}
-form {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    height: 100vh; /* Optional: centers vertically within the viewport */
+    margin: 0;
+    padding: 0;
 }
 
-form input, form button {
-    margin: 10px 0; /* Adds spacing between inputs */
+body {
+    background: transparent;
+    overflow: hidden;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    font-size: 18px;
+    height: auto;
+    width: 75%;
+    position: absolute; /* Allows precise placement */
+    top: 0px; /* Adjust this value to set vertical position */
+    left: 0px; /* Adjust this value to set horizontal position */
+}
+
+/* ── Chat overlay ─────────────────────────────────────────── */
+.chat {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 12px;
+    width: 100%;
+    height: 100vh;
+    justify-content: flex-end;
+    overflow: hidden;
+}
+
+.chat-message {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+}
+
+.chat-message.slide-in,
+.chat-message.slide-in-right {
+    animation: slideInRight 0.4s ease-out;
+}
+
+.chat-message.slide-in-left {
+    animation: slideInLeft 0.4s ease-out;
+}
+
+@keyframes slideInLeft {
+    from {
+        opacity: 0;
+        transform: translateX(-110%);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+@keyframes slideInRight {
+    from {
+        opacity: 0;
+        transform: translateX(110%);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+/* Username pill — sits on top of the message box */
+.username-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    border-radius: 16px;
+    padding: 4px 12px 4px 8px;
+    position: relative;
+    z-index: 2;
+    margin-left: 8px;
+    margin-bottom: -12px; /* overlap into the message box below */
+}
+
+.username {
+    font-weight: 700;
+    font-size: 0.9em;
+    white-space: nowrap;
+    line-height: 1.4;
+}
+
+.badge {
+    width: 18px;
+    height: 18px;
+    object-fit: contain;
+    vertical-align: middle;
+    flex-shrink: 0;
+}
+
+/* Message card — flat top-left corner where the pill sits */
+.message-box {
+    background: rgba(239, 214, 153, 0.882);
+    border-radius: 4px 18px 18px 18px;
+    padding: 18px 14px 10px 14px;
+    color: #000000ff;
+    word-break: break-word;
+    line-height: 1.6;
+    backdrop-filter: blur(4px);
+    min-width: 280px;
+    margin-left: 20px;
+}
+
+.emote {
+    height: 1.6em;
+    vertical-align: middle;
+    object-fit: contain;
+}
+
+.emote-only .emote {
+    height: 3em;
+}
+
+/* ── Config page ──────────────────────────────────────────── */
+body.config-page {
+    background: #0e0b1a;
+    overflow: auto;
+    position: static;
+    width: 100%;
+    height: 100vh;
+    color: #e8e0f5;
+    display: flex;
+    flex-direction: column;
+}
+
+.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 24px;
+    background: #13102a;
+    border-bottom: 1px solid #2a1f50;
+    flex-shrink: 0;
+}
+
+.topbar-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 1.15em;
+    font-weight: 700;
+    color: #c9b4ff;
+}
+
+.topbar-title svg { color: #9146ff; }
+
+.btn-copy {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #9146ff;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 0.9em;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s;
+}
+
+.btn-copy:hover  { background: #7b2fff; }
+.btn-copy:active { transform: scale(0.97); }
+.btn-copy.copied { background: #2ecc71; }
+
+.btn-save              { background: #1a6b3a; }
+.btn-save:hover        { background: #1f8a4a; }
+.btn-save.saved        { background: #2ecc71; }
+
+.config-main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+}
+
+.config-panel {
+    width: 320px;
+    min-width: 260px;
+    background: #13102a;
+    border-right: 1px solid #2a1f50;
+    padding: 24px 20px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+}
+
+.config-section-title {
+    font-size: 0.72em;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: #9146ff;
+    font-weight: 700;
+    margin-bottom: 14px;
+}
+
+.config-field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-bottom: 14px;
+}
+
+.config-field:last-child { margin-bottom: 0; }
+
+.config-field label {
+    font-size: 0.87em;
+    color: #b8a8d8;
+    font-weight: 500;
+}
+
+.config-field input[type="text"],
+.config-field input[type="password"] {
+    background: #0e0b1a;
+    border: 1px solid #3a2060;
+    border-radius: 7px;
+    color: #e8e0f5;
+    padding: 9px 12px;
+    font-size: 0.93em;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.config-field input:focus {
+    border-color: #9146ff;
+    box-shadow: 0 0 0 3px rgba(145, 70, 255, 0.18);
+}
+
+.config-field .hint {
+    font-size: 0.77em;
+    color: #6a5a8a;
+    line-height: 1.5;
+}
+
+.config-field .hint a {
+    color: #9146ff;
+    text-decoration: none;
+}
+
+.config-field .hint a:hover { text-decoration: underline; }
+
+.badge-optional {
+    font-size: 0.8em;
+    font-weight: 400;
+    color: #6a5a8a;
+}
+
+.config-preview {
+    flex: 1;
+    background: #0a0816;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    overflow: hidden;
+}
+
+.preview-label {
+    position: absolute;
+    top: 8px;
+    left: 12px;
+    z-index: 10;
+    font-size: 0.72em;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: rgba(255,255,255,0.18);
+    font-weight: 700;
+    pointer-events: none;
+}
+
+.preview-frame {
+    flex: 1;
+    width: 100%;
+    height: 100%;
+    border: none;
+    display: block;
+    background: transparent;
+}
+
+.config-preview .chat {
+    height: auto;
+    width: 100%;
+    max-width: 460px;
+    padding: 0;
+    overflow: visible;
+    justify-content: flex-end;
+}
+
+/* ── Config right panel ─────────────────────────────── */
+.config-panel--right {
+    border-right: none;
+    border-left: 1px solid #2a1f50;
+}
+
+.config-section {
+    display: flex;
+    flex-direction: column;
+}
+
+.config-field select {
+    background: #0e0b1a;
+    border: 1px solid #3a2060;
+    border-radius: 7px;
+    color: #e8e0f5;
+    padding: 9px 12px;
+    font-size: 0.93em;
+    font-family: inherit;
+    outline: none;
+    width: 100%;
+    cursor: pointer;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23b8a8d8'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+}
+
+.config-field select:focus {
+    border-color: #9146ff;
+    box-shadow: 0 0 0 2px rgba(145, 70, 255, 0.2);
+}
+
+.config-field select option {
+    background: #1e1640;
+}
+
+.config-field input[type="number"] {
+    background: #0e0b1a;
+    border: 1px solid #3a2060;
+    border-radius: 7px;
+    color: #e8e0f5;
+    padding: 9px 12px;
+    font-size: 0.93em;
+    font-family: inherit;
+    outline: none;
+    width: 100%;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.config-field input[type="color"] {
+    width: 100%;
+    height: 38px;
+    border: 1px solid #3a2060;
+    border-radius: 7px;
+    background: #0e0b1a;
+    padding: 2px 4px;
+    cursor: pointer;
+    outline: none;
+}
+
+.config-field input[type="file"] {
+    display: none;
+}
+
+.file-label {
+    display: inline-flex;
+    align-items: center;
+    background: #1e1640;
+    border: 1px solid #3a2060;
+    border-radius: 7px;
+    color: #b8a8d8;
+    padding: 8px 12px;
+    font-size: 0.87em;
+    cursor: pointer;
+    user-select: none;
+    transition: border-color 0.15s, background 0.15s;
+}
+
+.file-label:hover {
+    border-color: #9146ff;
+    background: #241a50;
+}
+
+.range-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.config-field input[type="range"] {
+    flex: 1;
+    accent-color: #9146ff;
+    cursor: pointer;
+}
+
+.range-val {
+    font-size: 0.85em;
+    color: #b8a8d8;
+    min-width: 30px;
+    text-align: right;
+}
+
+.btn-small {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: transparent;
+    border: 1px solid #3a2060;
+    border-radius: 6px;
+    color: #9146ff;
+    padding: 5px 10px;
+    font-size: 0.8em;
+    font-family: inherit;
+    cursor: pointer;
+    width: fit-content;
+    transition: border-color 0.15s, background 0.15s;
+}
+
+.btn-small:hover {
+    border-color: #9146ff;
+    background: #1e1640;
+}
+
+.btn-reset {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    background: transparent;
+    border: 1px solid #5a1a1a;
+    border-radius: 8px;
+    color: #e05a5a;
+    padding: 10px;
+    font-size: 0.88em;
+    font-family: inherit;
+    cursor: pointer;
+    margin-top: auto;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.btn-reset:hover {
+    background: rgba(224, 90, 90, 0.12);
+    border-color: #e05a5a;
+}
+
+/* ── Left panel tabs ──────────────────────────────────────── */
+.panel-tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid #2a1f50;
+    padding-bottom: 12px;
+    flex-shrink: 0;
+}
+
+.panel-tab {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: #6a5a8a;
+    padding: 6px 14px;
+    font-size: 0.83em;
+    font-family: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.panel-tab:hover { color: #b8a8d8; }
+.panel-tab.active {
+    color: #c9b4ff;
+    border-color: #9146ff;
+    background: rgba(145, 70, 255, 0.12);
+}
+
+.panel-tab-content {
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+}
+
+/* ── CSS editor textarea ──────────────────────────────────── */
+.css-editor {
+    background: #0e0b1a;
+    border: 1px solid #3a2060;
+    border-radius: 7px;
+    color: #c9e8ff;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 0.82em;
+    line-height: 1.6;
+    padding: 10px 12px;
+    resize: vertical;
+    min-height: 180px;
+    width: 100%;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.css-editor:focus {
+    border-color: #9146ff;
+    box-shadow: 0 0 0 2px rgba(145, 70, 255, 0.18);
+}
+
+/* ── Bubble image gallery ─────────────────────────────────── */
+.img-gallery {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+}
+
+.img-thumb {
+    position: relative;
+    width: 56px;
+    height: 56px;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid #3a2060;
+    flex-shrink: 0;
+}
+
+.img-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.img-thumb-remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 17px;
+    height: 17px;
+    background: rgba(0, 0, 0, 0.72);
+    border: none;
+    border-radius: 50%;
+    color: #fff;
+    font-size: 9px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: background 0.15s;
+}
+
+.img-thumb-remove:hover { background: #e05a5a; }
+
+/* ── Generated CSS read-only preview ─────────────────────── */
+.css-preview {
+    background: #0e0b1a;
+    border: 1px solid #2a1f50;
+    border-radius: 7px;
+    color: #7a8fa0;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 0.8em;
+    line-height: 1.55;
+    padding: 10px 12px;
+    margin: 0;
+    white-space: pre;
+    overflow-x: auto;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+/* ── Preset list ──────────────────────────────────────────── */
+.preset-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.preset-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 10px;
+    background: rgba(145, 70, 255, 0.06);
+    border: 1px solid #2a1f50;
+    border-radius: 7px;
+}
+
+.preset-name {
+    flex: 1;
+    font-size: 0.88em;
+    color: #c9b4ff;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.btn-small--danger {
+    background: transparent;
+    border-color: #3a2060;
+    color: #e05a5a;
+}
+
+.btn-small--danger:hover {
+    background: rgba(224, 90, 90, 0.12);
+    border-color: #e05a5a;
+}
+
+/* ── Login page ───────────────────────────────────────────── */
+.Login {
+
+}
+
+/* ── Login Page Styling ───────────────────────────────── */
+.login-container {
+    max-width: 400px;
+    margin-left: 50%;
+    margin-top: 20%;
+    padding: 20px;
+    background: #1b0c3b;
+    border-radius: 8px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    text-align: center;
+}
+
+.login-container h1 {
+    margin-bottom: 20px;
+    font-size: 24px;
+    color: #e3d5d5;
+}
+
+.login-container label {
+    display: block;
+    margin: 10px 0 5px;
+    font-weight: bold;
+    color: #d5e2e2;
+}
+
+.login-container input {
+    width: 100%;
+    padding: 10px;
+    margin-bottom: 15px;
+    border: 1px solid #111d3d;
+    background-color: #203161;
+    border-radius: 4px;
+    font-size: 16px;
+    color : white;
+}
+
+.login-container button {
+    width: 100%;
+    padding: 10px;
+    background: #5a0fbd;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    font-size: 16px;
+    cursor: pointer;
+    transition: background 0.3s;
+}
+
+.login-container button:hover {
+    background: #0056b3;
+}
+
+#login-message {
+    margin-top: 15px;
+    font-size: 14px;
+}
+
+.video-list {
+    position: fixed;
+    left: 50%;
+    bottom: 0;
+    transform: translateX(-50%);
+    margin-bottom: 20px;
+    text-align: center;
+    width: auto;
+    z-index: 100;
+	padding: 10px 20px;
+	background: rgba(0, 0, 0, 0.6);
+	border-radius: 8px;
+	color: #fff;
+	font-size: 14px;
 }

@@ -1,0 +1,11 @@
+{
+    "accounts":
+    [
+        {
+            "username": "Username",
+            "oauthToken": "Twitch OAuth Token (without 'oauth:' prefix)",
+            "channel": "ChannelName",
+            "password": "your_password_here"
+        }
+    ]
+}
