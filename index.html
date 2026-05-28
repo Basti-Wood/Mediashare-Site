@@ -3,25 +3,52 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login</title>
+    <title>Mediashare — Login</title>
     <link rel="stylesheet" href="styles/bulma/css/bulma.min.css">
     <link rel="stylesheet" href="styles/mystyles.css">
 </head>
-<body>
-    <div class="login-container">
-        <h1>Login</h1>
-        <form id="login-form">
-            <label for="username">Username:</label>
-            <input type="text" id="username" name="username" required>
+<body class="login-body">
+    <section class="section">
+        <div class="container">
+            <div class="columns is-centered">
+                <div class="column is-narrow">
+                    <div class="box login-box">
+                        <h1 class="title has-text-centered">Mediashare</h1>
+                        <p class="subtitle has-text-centered is-6">Sign in to manage your channels</p>
 
-            <label for="password">Password:</label>
-            <input type="password" id="password" name="password" required>
+                        <form id="login-form">
+                            <div class="field">
+                                <label class="label" for="username">Username</label>
+                                <div class="control">
+                                    <input class="input" type="text" id="username"
+                                           name="username" autocomplete="username" required>
+                                </div>
+                            </div>
 
-            <button type="submit">Login</button>
-        </form>
-        <p id="login-message"></p>
-    </div>
+                            <div class="field">
+                                <label class="label" for="password">Password</label>
+                                <div class="control">
+                                    <input class="input" type="password" id="password"
+                                           name="password" autocomplete="current-password" required>
+                                </div>
+                            </div>
 
-    <script src="../src/login.js"></script>
+                            <div class="field">
+                                <div class="control">
+                                    <button class="button is-link is-fullwidth" type="submit" id="login-btn">
+                                        Login
+                                    </button>
+                                </div>
+                            </div>
+                        </form>
+
+                        <p id="login-message" class="help" style="min-height:1.2em"></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <script src="src/login.js"></script>
 </body>
 </html>

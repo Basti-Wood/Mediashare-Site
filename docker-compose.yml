@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  mediashare:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      # mount conf/ so you can edit accounts without rebuilding the image
+      - ./conf:/app/conf:ro
+    restart: unless-stopped

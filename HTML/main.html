@@ -1,29 +1,101 @@
 <!DOCTYPE html>
-<html lang="de">
-
+<html lang="en">
 <head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<link rel="stylesheet" href="../styles/bulma/css/bulma.min.css">
-	<link rel="stylesheet" href="../styles/mystyles.css">
-	<script src="https://www.youtube.com/iframe_api"></script>
-	<title>Mediashare</title>
-	
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mediashare — Dashboard</title>
+    <link rel="stylesheet" href="../styles/bulma/css/bulma.min.css">
+    <link rel="stylesheet" href="../styles/mystyles.css">
 </head>
+<body class="dashboard-body">
 
-<body>
-	<div class="content">
-		<iframe id="preview-frame" class="preview-frame" src="overlay.html" title="Mediashare preview"></iframe>
-		<div class="video-list">
-			<table>
-				<tr>
-					<td><p>video</p></td>
-					<td><p>Video Title</p></td>
-					<td><p>Submitter</p></td>
-					<td><p>Delete</p></td>
-				</tr>
-			</table>
-		</div>
-	</div>
+    <!-- ── Navbar ──────────────────────────────────────────────────────────── -->
+    <nav class="navbar is-dark" role="navigation">
+        <div class="navbar-brand">
+            <span class="navbar-item has-text-weight-bold is-size-5">Mediashare</span>
+        </div>
+        <div class="navbar-end">
+            <div class="navbar-item">
+                <span id="nav-user" class="has-text-grey-light is-size-7 mr-3"></span>
+                <button id="logout-btn" class="button is-small is-danger is-outlined">Logout</button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ── Channel tabs ─────────────────────────────────────────────────────── -->
+    <div class="tabs-wrapper px-4 pt-3">
+        <div class="tabs is-boxed" id="channel-tabs">
+            <ul id="channel-tab-list">
+                <!-- populated by JS -->
+            </ul>
+        </div>
+    </div>
+
+    <!-- ── Main content ─────────────────────────────────────────────────────── -->
+    <div class="columns is-gapless dashboard-columns px-4 pb-4">
+
+        <!-- Left: overlay preview -->
+        <div class="column is-7 pr-3">
+            <div class="box preview-box">
+                <p class="heading mb-2">Live Preview</p>
+                <iframe id="preview-frame"
+                        class="preview-frame"
+                        src="overlay.html?channel="
+                        title="Overlay preview"
+                    allow="autoplay; encrypted-media; fullscreen; picture-in-picture">
+                </iframe>
+                <p class="help mt-2">
+                    OBS Overlay URL: <code id="overlay-url"></code>
+                </p>
+            </div>
+        </div>
+
+        <!-- Right: queue -->
+        <div class="column is-5">
+            <div class="box queue-box">
+
+                <!-- Now playing -->
+                <p class="heading mb-2">Now Playing</p>
+                <div id="now-playing-info" class="mb-4">
+                    <span class="has-text-grey">Nothing playing.</span>
+                </div>
+
+                <hr class="queue-divider">
+
+                <!-- Upcoming -->
+                <div class="level mb-2">
+                    <div class="level-left">
+                        <p class="heading level-item">
+                            Up Next&nbsp;<span id="queue-count" class="tag is-dark">0</span>
+                        </p>
+                    </div>
+                </div>
+
+                <div id="queue-empty" class="has-text-centered has-text-grey py-4">
+                    Queue is empty.
+                </div>
+
+                <table class="table is-fullwidth is-hoverable is-narrow"
+                       id="queue-table" style="display:none">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Thumb</th>
+                            <th>Platform</th>
+                            <th>Title</th>
+                            <th>By</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="queue-tbody"></tbody>
+                </table>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- Socket.io client -->
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="../scrs/frontend/main.js"></script>
 </body>
 </html>

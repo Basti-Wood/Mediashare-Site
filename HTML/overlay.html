@@ -1,19 +1,72 @@
 <!DOCTYPE html>
-<html lang="de">
-
+<html lang="en">
 <head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<link rel="stylesheet" href="../styles/bulma/css/bulma.min.css">
-	<link rel="stylesheet" href="../styles/mystyles.css">
-	<script src="https://www.youtube.com/iframe_api"></script>
-	<title>Mediashare</title>
-	
-</head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mediashare Overlay</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
+        html, body {
+            width: 100%;
+            height: 100%;
+            background: transparent;
+            overflow: hidden;
+        }
+
+        #player-container {
+            width: 100%;
+            height: 100%;
+            position: relative;
+            background: #000;
+        }
+
+        /* YouTube div / iframe fills the entire container */
+        #yt-player,
+        #yt-player iframe {
+            width: 100% !important;
+            height: 100% !important;
+            border: none;
+        }
+
+        /* Spotify embed */
+        #spotify-player {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            border: none;
+        }
+
+        #idle-screen {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #555;
+            font-family: 'Segoe UI', sans-serif;
+            font-size: 1.2rem;
+        }
+    </style>
+</head>
 <body>
-	<div class="player">
-		
-	</div>
+    <div id="player-container">
+        <div id="idle-screen">Waiting for media…</div>
+        <!-- YouTube player target -->
+        <div id="yt-player" style="display:none"></div>
+        <!-- Spotify embed target -->
+        <iframe id="spotify-player"
+                style="display:none"
+                allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+                loading="lazy"
+                height="152">
+        </iframe>
+    </div>
+
+    <!-- Socket.io client -->
+    <script src="/socket.io/socket.io.js"></script>
+    <!-- YouTube IFrame API -->
+    <script src="https://www.youtube.com/iframe_api"></script>
+    <script src="../scrs/frontend/overlay.js"></script>
 </body>
 </html>
