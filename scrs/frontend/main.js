@@ -147,8 +147,9 @@ function switchChannel(channel) {
     tabList.querySelectorAll('li').forEach(li =>
         li.classList.toggle('is-active', li.dataset.channel === channel));
 
-    const overlayPath = `/HTML/overlay.html?channel=${encodeURIComponent(channel)}`;
-    previewFrame.src  = overlayPath;
+    const overlayPath    = `/HTML/overlay.html?channel=${encodeURIComponent(channel)}`;
+    const previewPath    = `${overlayPath}&controls=1`;
+    previewFrame.src     = previewPath;
     overlayUrl.textContent = `${window.location.origin}${overlayPath}`;
 
     if (socket) socket.emit('join:channel', channel);

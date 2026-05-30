@@ -256,6 +256,9 @@ app.use(session({
 
 app.use(express.static(path.join(__dirname, '../..')));
 
+// Suppress favicon 404
+app.get('/favicon.ico', (_req, res) => res.status(204).end());
+
 function requireAuth(req, res, next) {
     if (!req.session.user) return res.status(401).json({ error: 'Not logged in.' });
     next();
