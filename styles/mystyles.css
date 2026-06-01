@@ -5,7 +5,9 @@
     background: #1a1a2e;
     min-height: 100vh;
     display: flex;
+    flex-direction: column;
     align-items: center;
+    justify-content: center;
 }
 .login-box {
     width: 360px;
@@ -104,6 +106,54 @@
 .media-link:hover {
     text-decoration: underline;
     color: #c2ddff;
+}
+
+/* ── Queue-type tabs (inside queue box) ────────────────────── */
+#queue-type-tabs.tabs.is-boxed {
+    margin-bottom: 0.75rem;
+}
+#queue-type-tabs.tabs.is-boxed ul {
+    border-bottom-color: #333;
+}
+#queue-type-tabs.tabs.is-boxed li a {
+    color: #aaa;
+    border-color: #333;
+    background: transparent;
+}
+#queue-type-tabs.tabs.is-boxed li.is-active a {
+    background: #0f3460;
+    border-color: #0f3460;
+    color: #fff;
+}
+#queue-type-tabs.tabs.is-boxed li a:hover {
+    border-color: #444;
+    color: #e0e0e0;
+    background: #2a2a2a;
+}
+
+/* ── My List input ─────────────────────────────────────────── */
+#mylist-url-input {
+    background: #1a1a1a;
+    border-color: #333;
+    color: #e0e0e0;
+}
+#mylist-url-input::placeholder { color: #555; }
+#mylist-url-input:focus {
+    border-color: #0f3460;
+    box-shadow: 0 0 0 0.125em rgba(15, 52, 96, 0.35);
+}
+#mylist-add-status { min-height: 1.2em; }
+
+/* ── Mode selector ──────────────────────────────────── */
+#mode-select {
+    background: #1a1a1a;
+    border-color: #444;
+    color: #e0e0e0;
+    font-size: 0.78rem;
+}
+#mode-select:focus {
+    border-color: #0f3460;
+    box-shadow: 0 0 0 0.125em rgba(15, 52, 96, 0.35);
 }
 
 /* ── Overlay (transparent for OBS) ────────────────────────── */

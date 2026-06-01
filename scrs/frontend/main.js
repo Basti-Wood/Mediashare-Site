@@ -3,19 +3,35 @@
 let currentChannel = null;
 let socket         = null;
 let user           = null;
+let activeQueueTab = 'requests';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
-const navUser       = document.getElementById('nav-user');
-const logoutBtn     = document.getElementById('logout-btn');
-const tabList       = document.getElementById('channel-tab-list');
-const previewFrame  = document.getElementById('preview-frame');
-const overlayUrl    = document.getElementById('overlay-url');
-const nowPlaying    = document.getElementById('now-playing-info');
-const queueCount    = document.getElementById('queue-count');
-const queueEmpty    = document.getElementById('queue-empty');
-const queueTable    = document.getElementById('queue-table');
-const queueTbody    = document.getElementById('queue-tbody');
+const navUser         = document.getElementById('nav-user');
+const logoutBtn       = document.getElementById('logout-btn');
+const tabList         = document.getElementById('channel-tab-list');
+const previewFrame    = document.getElementById('preview-frame');
+const overlayUrl      = document.getElementById('overlay-url');
+const nowPlaying      = document.getElementById('now-playing-info');
+const queueCount      = document.getElementById('queue-count');
+const queueEmpty      = document.getElementById('queue-empty');
+const queueTable      = document.getElementById('queue-table');
+const queueTbody      = document.getElementById('queue-tbody');
+
+// My List DOM refs
+const queueTypeTabs   = document.getElementById('queue-type-tabs');
+const panelRequests   = document.getElementById('panel-requests');
+const panelMylist     = document.getElementById('panel-mylist');
+const mylistUrlInput  = document.getElementById('mylist-url-input');
+const mylistAddBtn    = document.getElementById('mylist-add-btn');
+const mylistAddStatus = document.getElementById('mylist-add-status');
+const mylistCount     = document.getElementById('mylist-count');
+const mylistEmpty     = document.getElementById('mylist-empty');
+const mylistTable     = document.getElementById('mylist-table');
+const mylistTbody     = document.getElementById('mylist-tbody');
+
+// Mode selector
+const modeSelect      = document.getElementById('mode-select');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -56,6 +72,153 @@ function renderTitle(item) {
     const url = getMediaUrl(item);
     if (!url) return `<span class="media-link">${title}</span>`;
     return `<a class="media-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Open media link">${title}</a>`;
+}
+
+// ── Play mode ────────────────────────────────────────────────────────────────────
+
+async function loadMode() {
+    if (!currentChannel) return;
+    try {
+        const res  = await fetch(`/api/mode/${encodeURIComponent(currentChannel)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        modeSelect.value = data.mode || 'requests';
+    } catch {}
+}
+
+modeSelect.addEventListener('change', async () => {
+    if (!currentChannel) return;
+    try {
+        await fetch(`/api/mode/${encodeURIComponent(currentChannel)}`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ mode: modeSelect.value })
+        });
+    } catch (e) {
+        console.error('Failed to set mode', e);
+    }
+});
+
+// ── My List helpers ──────────────────────────────────────────────────────────
+
+function getMylistThumbnailHtml(item) {
+    const ytId = getYouTubeId(item.url || '');
+    if (!ytId) return '<span class="media-thumb media-thumb-placeholder" aria-hidden="true"></span>';
+    return `<img class="media-thumb" src="https://i.ytimg.com/vi/${esc(ytId)}/mqdefault.jpg" alt="thumbnail" loading="lazy">`;
+}
+
+function renderMylistTitle(item) {
+    const title = esc(item?.title || 'Unknown Title');
+    const url   = item?.url || '';
+    if (!url) return `<span class="media-link">${title}</span>`;
+    return `<a class="media-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${title}</a>`;
+}
+
+function mylistPlatformTag(platform) {
+    const map = { youtube: 'is-danger', 'youtube-playlist': 'is-warning', spotify: 'is-success' };
+    const cls = map[platform] || 'is-dark';
+    const label = platform === 'youtube-playlist' ? 'playlist' : (platform || 'other');
+    return `<span class="tag ${cls} is-small">${esc(label)}</span>`;
+}
+
+function renderMyList(items) {
+    mylistCount.textContent = items.length;
+    if (items.length === 0) {
+        mylistEmpty.style.display = '';
+        mylistTable.style.display = 'none';
+        return;
+    }
+    mylistEmpty.style.display = 'none';
+    mylistTable.style.display = '';
+    mylistTbody.innerHTML = items.map((item, i) => `
+        <tr>
+            <td>${i + 1}</td>
+            <td>${getMylistThumbnailHtml(item)}</td>
+            <td>${mylistPlatformTag(item.platform)}</td>
+            <td class="queue-title">${renderMylistTitle(item)}</td>
+            <td>
+                <button class="button is-danger is-small"
+                        data-ml-index="${i}" title="Remove">✕</button>
+            </td>
+        </tr>
+    `).join('');
+    mylistTbody.querySelectorAll('button[data-ml-index]').forEach(btn => {
+        btn.addEventListener('click', () => removeFromMyList(Number(btn.dataset.mlIndex)));
+    });
+}
+
+// ── My List API ───────────────────────────────────────────────────────────────
+
+async function loadMyList() {
+    if (!currentChannel) return;
+    try {
+        const res  = await fetch(`/api/mylist/${encodeURIComponent(currentChannel)}`);
+        if (!res.ok) throw new Error(res.status);
+        const data = await res.json();
+        renderMyList(Array.isArray(data.items) ? data.items : []);
+    } catch (e) {
+        console.error('Failed to load my list', e);
+    }
+}
+
+async function addToMyList(url) {
+    if (!url.trim()) return;
+    mylistAddBtn.disabled = true;
+    mylistAddStatus.className = 'is-size-7 mb-3 has-text-grey';
+    mylistAddStatus.textContent = 'Adding…';
+    try {
+        const res  = await fetch(`/api/mylist/${encodeURIComponent(currentChannel)}/add`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ url: url.trim() })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            mylistAddStatus.className = 'is-size-7 mb-3 has-text-danger';
+            mylistAddStatus.textContent = data.error || 'Failed to add.';
+        } else {
+            const n = data.added?.length ?? 1;
+            mylistAddStatus.className = 'is-size-7 mb-3 has-text-success';
+            mylistAddStatus.textContent = `Added ${n} song${n !== 1 ? 's' : ''}.`;
+            mylistUrlInput.value = '';
+            await loadMyList();
+        }
+    } catch {
+        mylistAddStatus.className = 'is-size-7 mb-3 has-text-danger';
+        mylistAddStatus.textContent = 'Network error.';
+    } finally {
+        mylistAddBtn.disabled = false;
+    }
+}
+
+async function removeFromMyList(index) {
+    try {
+        await fetch(`/api/mylist/${encodeURIComponent(currentChannel)}/remove/${index}`,
+                    { method: 'POST' });
+        await loadMyList();
+    } catch (e) {
+        console.error('Failed to remove from my list', e);
+    }
+}
+
+// ── Queue-type tab switching ──────────────────────────────────────────────────
+
+function setupQueueTypeTabs() {
+    queueTypeTabs.querySelectorAll('li[data-tab]').forEach(li => {
+        li.addEventListener('click', () => {
+            activeQueueTab = li.dataset.tab;
+            queueTypeTabs.querySelectorAll('li').forEach(t =>
+                t.classList.toggle('is-active', t === li));
+            panelRequests.style.display = activeQueueTab === 'requests' ? '' : 'none';
+            panelMylist.style.display   = activeQueueTab === 'mylist'   ? '' : 'none';
+            if (activeQueueTab === 'mylist') loadMyList();
+        });
+    });
+
+    mylistAddBtn.addEventListener('click', () => addToMyList(mylistUrlInput.value));
+    mylistUrlInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') addToMyList(mylistUrlInput.value);
+    });
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
@@ -150,10 +313,12 @@ function switchChannel(channel) {
     const overlayPath    = `/HTML/overlay.html?channel=${encodeURIComponent(channel)}`;
     const previewPath    = `${overlayPath}&controls=1`;
     previewFrame.src     = previewPath;
-    overlayUrl.textContent = `${window.location.origin}${overlayPath}`;
+    if (overlayUrl) overlayUrl.textContent = `${window.location.origin}${overlayPath}`;
 
     if (socket) socket.emit('join:channel', channel);
     loadMedia();
+    loadMode();
+    if (activeQueueTab === 'mylist') loadMyList();
 }
 
 function buildTabs(channels) {
@@ -185,6 +350,7 @@ async function init() {
     socket.on('connect', () => { if (currentChannel) socket.emit('join:channel', currentChannel); });
     socket.on('queue:update', ({ channel }) => { if (channel === currentChannel) loadMedia(); });
 
+    setupQueueTypeTabs();
     switchChannel(channels[0]);
 }
 

@@ -59,33 +59,101 @@
 
                 <hr class="queue-divider">
 
-                <!-- Upcoming -->
-                <div class="level mb-2">
+                <!-- Play mode selector -->
+                <div class="level mb-3">
                     <div class="level-left">
-                        <p class="heading level-item">
-                            Up Next&nbsp;<span id="queue-count" class="tag is-dark">0</span>
-                        </p>
+                        <p class="heading level-item mb-0">Play Mode</p>
+                    </div>
+                    <div class="level-right">
+                        <div class="level-item">
+                            <div class="select is-small is-dark">
+                                <select id="mode-select">
+                                    <option value="requests">Viewer Requests only</option>
+                                    <option value="mylist">My List only</option>
+                                    <option value="switch">Alternate (Viewer → Mine)</option>
+                                </select>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
-                <div id="queue-empty" class="has-text-centered has-text-grey py-4">
-                    Queue is empty.
+                <!-- Queue-type tab switcher -->
+                <div class="tabs is-small is-boxed mb-3" id="queue-type-tabs">
+                    <ul>
+                        <li class="is-active" data-tab="requests"><a>Viewer Requests</a></li>
+                        <li data-tab="mylist"><a>My List</a></li>
+                    </ul>
                 </div>
 
-                <table class="table is-fullwidth is-hoverable is-narrow"
-                       id="queue-table" style="display:none">
-                    <thead>
-                        <tr>
-                            <th>#</th>
-                            <th>Thumb</th>
-                            <th>Platform</th>
-                            <th>Title</th>
-                            <th>By</th>
-                            <th></th>
-                        </tr>
-                    </thead>
-                    <tbody id="queue-tbody"></tbody>
-                </table>
+                <!-- ── Viewer Requests panel ── -->
+                <div id="panel-requests">
+                    <div class="level mb-2">
+                        <div class="level-left">
+                            <p class="heading level-item">
+                                Up Next&nbsp;<span id="queue-count" class="tag is-dark">0</span>
+                            </p>
+                        </div>
+                    </div>
+
+                    <div id="queue-empty" class="has-text-centered has-text-grey py-4">
+                        Queue is empty.
+                    </div>
+
+                    <table class="table is-fullwidth is-hoverable is-narrow"
+                           id="queue-table" style="display:none">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Thumb</th>
+                                <th>Platform</th>
+                                <th>Title</th>
+                                <th>By</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="queue-tbody"></tbody>
+                    </table>
+                </div>
+
+                <!-- ── My List panel ── -->
+                <div id="panel-mylist" style="display:none">
+                    <div class="field has-addons mb-1">
+                        <div class="control is-expanded">
+                            <input id="mylist-url-input" class="input is-small" type="url"
+                                   placeholder="Paste YouTube video or playlist URL (youtube.com/playlist?list=…)">
+                        </div>
+                        <div class="control">
+                            <button id="mylist-add-btn" class="button is-small is-link">Add</button>
+                        </div>
+                    </div>
+                    <p id="mylist-add-status" class="is-size-7 mb-3"></p>
+
+                    <div class="level mb-2">
+                        <div class="level-left">
+                            <p class="heading level-item">
+                                My Songs&nbsp;<span id="mylist-count" class="tag is-dark">0</span>
+                            </p>
+                        </div>
+                    </div>
+
+                    <div id="mylist-empty" class="has-text-centered has-text-grey py-4">
+                        No songs added yet.
+                    </div>
+
+                    <table class="table is-fullwidth is-hoverable is-narrow"
+                           id="mylist-table" style="display:none">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Thumb</th>
+                                <th>Platform</th>
+                                <th>Title</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="mylist-tbody"></tbody>
+                    </table>
+                </div>
 
             </div>
         </div>

@@ -238,6 +238,152 @@ function hasAccess(user, channel, accounts = loadAccounts()) {
     return viewers.has(normalizeIdentifier(user.channel)) || viewers.has(normalizeIdentifier(user.username));
 }
 
+// ── Personal list + play-mode (in-memory, per channel) ───────────────────────────
+
+// mylistByChannel: channel -> string[] items
+const mylistByChannel = new Map();
+// modeByChannel:   channel -> { mode: 'requests'|'mylist'|'switch', switchTurn: 'requests'|'mylist' }
+const modeByChannel   = new Map();
+
+function getMyList(channel) {
+    if (!mylistByChannel.has(channel)) mylistByChannel.set(channel, []);
+    return mylistByChannel.get(channel);
+}
+
+function getMode(channel) {
+    if (!modeByChannel.has(channel)) modeByChannel.set(channel, { mode: 'requests', switchTurn: 'requests' });
+    return modeByChannel.get(channel);
+}
+
+// Keep loadChannelMyList / saveChannelMyList as thin wrappers so existing call-sites stay untouched
+function loadChannelMyList(channel) { return { items: getMyList(channel) }; }
+function saveChannelMyList(channel, data) { mylistByChannel.set(channel, data.items || []); }
+function loadChannelMode(channel) { return getMode(channel); }
+function saveChannelMode(channel, data) { modeByChannel.set(channel, data); }
+
+function parseYouTubeVideoId(url) {
+    const s = String(url);
+    if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+    const m = s.match(/(?:youtube\.com\/(?:watch\?.*?v=|shorts\/|embed\/|v\/|e\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+    return m ? m[1] : null;
+}
+
+function parseYouTubePlaylistId(url) {
+    const m = String(url).match(/[?&]list=([A-Za-z0-9_-]+)/);
+    return m ? m[1] : null;
+}
+
+async function resolveYouTubeVideoTitle(videoId) {
+    try {
+        const r = await fetch(
+            `https://www.youtube.com/oembed?url=${encodeURIComponent('https://www.youtube.com/watch?v=' + videoId)}&format=json`
+        );
+        if (!r.ok) return null;
+        const d = await r.json();
+        return d.title || null;
+    } catch { return null; }
+}
+
+async function expandYouTubePlaylistViaScrape(playlistId) {
+    try {
+        const r = await fetch(
+            `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`,
+            {
+                headers: {
+                    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9'
+                }
+            }
+        );
+        if (!r.ok) { console.warn(`Playlist scrape HTTP ${r.status} for ${playlistId}`); return null; }
+        const html = await r.text();
+
+        // ── Step 1: extract ytInitialData JSON by counting braces ────────────
+        const marker   = 'var ytInitialData = ';
+        const startIdx = html.indexOf(marker);
+        if (startIdx === -1) { console.warn('ytInitialData marker not found'); return null; }
+
+        const jsonStart = startIdx + marker.length;
+        let depth = 0, inString = false, escape = false, end = -1;
+        for (let i = jsonStart; i < html.length; i++) {
+            const c = html[i];
+            if (escape)               { escape = false; continue; }
+            if (c === '\\' && inString) { escape = true;  continue; }
+            if (c === '"')              { inString = !inString; continue; }
+            if (inString)               continue;
+            if (c === '{') depth++;
+            else if (c === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+        }
+        if (end === -1) { console.warn('Could not find end of ytInitialData JSON'); return null; }
+
+        let parsed;
+        try { parsed = JSON.parse(html.slice(jsonStart, end)); }
+        catch (e) { console.warn('ytInitialData JSON parse failed:', e.message); return null; }
+
+        // ── Step 2: walk the entire tree looking for playlistVideoRenderer ───
+        const now   = new Date().toISOString();
+        const items = [];
+        const seen  = new Set();
+
+        function walk(obj) {
+            if (!obj || typeof obj !== 'object') return;
+            if (Array.isArray(obj)) { obj.forEach(walk); return; }
+
+            const v = obj.playlistVideoRenderer;
+            if (v?.videoId && !seen.has(v.videoId)) {
+                seen.add(v.videoId);
+                const title = v.title?.runs?.[0]?.text
+                           || v.title?.simpleText
+                           || 'Unknown Title';
+                items.push({ url: `https://www.youtube.com/watch?v=${v.videoId}`, title, platform: 'youtube', addedAt: now });
+                return; // no need to descend further into this renderer
+            }
+            for (const val of Object.values(obj)) walk(val);
+        }
+
+        walk(parsed);
+        console.log(`Scraped ${items.length} videos from playlist ${playlistId}`);
+        return items.length > 0 ? items : null;
+    } catch (e) { console.error('Playlist scrape error:', e.message); return null; }
+}
+
+async function expandYouTubePlaylist(playlistId) {
+    const apiKey = process.env.YOUTUBE_API_KEY;
+
+    if (apiKey) {
+        // Full expansion via YouTube Data API v3 (up to 200 items)
+        const items = [];
+        let pageToken = '';
+        let pages = 0;
+        do {
+            let url = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId=${encodeURIComponent(playlistId)}&key=${encodeURIComponent(apiKey)}`;
+            if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+            const r = await fetch(url);
+            if (!r.ok) break;
+            const data = await r.json();
+            if (data.error) { console.error('YouTube API error:', data.error.message); break; }
+            for (const item of (data.items || [])) {
+                const videoId = item.snippet?.resourceId?.videoId;
+                const title   = item.snippet?.title;
+                if (videoId && title !== 'Deleted video' && title !== 'Private video') {
+                    items.push({
+                        url:      `https://www.youtube.com/watch?v=${videoId}`,
+                        title:    title || 'Unknown Title',
+                        platform: 'youtube',
+                        addedAt:  new Date().toISOString()
+                    });
+                }
+            }
+            pageToken = data.nextPageToken || '';
+            pages++;
+        } while (pageToken && pages < 4);
+        if (items.length > 0) return items;
+    }
+
+    // Fallback: scrape the YouTube playlist page (no API key required)
+    return expandYouTubePlaylistViaScrape(playlistId);
+}
+
 // ── Middleware ────────────────────────────────────────────────────────────────
 
 // Block raw access to config/env files
@@ -325,24 +471,170 @@ app.post('/api/media/:owner/remove/:index', requireAuth, async (req, res) => {
     }
 });
 
+// ── Personal list (stored locally per channel) ────────────────────────────────
+
+app.get('/api/mylist/:owner', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.owner))
+        return res.status(403).json({ error: 'Access denied.' });
+    res.json(loadChannelMyList(req.params.owner));
+});
+
+app.post('/api/mylist/:owner/add', requireAuth, async (req, res) => {
+    if (!hasAccess(req.session.user, req.params.owner))
+        return res.status(403).json({ error: 'Access denied.' });
+
+    const { url } = req.body;
+    if (!url || typeof url !== 'string' || !url.trim())
+        return res.status(400).json({ error: 'URL required.' });
+
+    const rawUrl    = url.trim();
+    const data      = loadChannelMyList(req.params.owner);
+    const added     = [];
+    const now       = new Date().toISOString();
+    const playlistId = parseYouTubePlaylistId(rawUrl);
+
+    if (playlistId) {
+        // Any YouTube URL with a list= param → try to expand the full playlist
+        const expanded = await expandYouTubePlaylist(playlistId);
+        if (expanded && expanded.length > 0) {
+            data.items.push(...expanded);
+            added.push(...expanded);
+        } else {
+            // Could not expand (private/unavailable playlist) — store as stub
+            const entry = {
+                url:        rawUrl,
+                title:      `YouTube Playlist (${playlistId})`,
+                platform:   'youtube-playlist',
+                playlistId,
+                addedAt:    now
+            };
+            data.items.push(entry);
+            added.push(entry);
+        }
+    } else {
+        const videoId = parseYouTubeVideoId(rawUrl);
+        if (videoId) {
+            const title = await resolveYouTubeVideoTitle(videoId) || 'Unknown Title';
+            const entry = { url: rawUrl, title, platform: 'youtube', addedAt: now };
+            data.items.push(entry);
+            added.push(entry);
+        } else if (rawUrl.includes('spotify.com')) {
+            const entry = { url: rawUrl, title: 'Spotify Track', platform: 'spotify', addedAt: now };
+            data.items.push(entry);
+            added.push(entry);
+        } else {
+            const entry = { url: rawUrl, title: rawUrl, platform: 'other', addedAt: now };
+            data.items.push(entry);
+            added.push(entry);
+        }
+    }
+
+    saveChannelMyList(req.params.owner, data);
+    res.json({ success: true, added, total: data.items.length });
+});
+
+app.post('/api/mylist/:owner/remove/:index', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.owner))
+        return res.status(403).json({ error: 'Access denied.' });
+
+    const index = parseInt(req.params.index, 10);
+    const data  = loadChannelMyList(req.params.owner);
+
+    if (isNaN(index) || index < 0 || index >= data.items.length)
+        return res.status(400).json({ error: 'Invalid index.' });
+
+    data.items.splice(index, 1);
+    saveChannelMyList(req.params.owner, data);
+    res.json({ success: true, total: data.items.length });
+});
+
+// ── Mode API ──────────────────────────────────────────────────────────────────
+
+app.get('/api/mode/:channel', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    res.json(loadChannelMode(req.params.channel));
+});
+
+app.post('/api/mode/:channel', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    const { mode } = req.body;
+    const valid = ['requests', 'mylist', 'switch'];
+    if (!valid.includes(mode))
+        return res.status(400).json({ error: 'Invalid mode.' });
+    const data = loadChannelMode(req.params.channel);
+    data.mode = mode;
+    if (mode === 'switch') data.switchTurn = 'requests';
+    saveChannelMode(req.params.channel, data);
+    io.to(`ch:${req.params.channel}`).emit('queue:update', { channel: req.params.channel });
+    res.json({ success: true, mode });
+});
+
 // ── Overlay endpoints (no auth — used by OBS browser source) ─────────────────
 
-// Get the current (first) item
+// Get the current (first) item — respects play mode
 app.get('/api/channels/:ch/current', async (req, res) => {
+    const ch = req.params.ch;
+    const modeData = loadChannelMode(ch);
+    const { mode } = modeData;
+    const effectiveSource = mode === 'switch' ? modeData.switchTurn : mode;
+
+    if (effectiveSource === 'mylist') {
+        const listData = loadChannelMyList(ch);
+        // fall back to requests if mylist is empty in switch mode
+        if (listData.items.length > 0) {
+            return res.json({ current: { ...listData.items[0], _source: 'mylist' } });
+        }
+        if (mode !== 'switch') return res.json({ current: null });
+    }
+
+    // requests source (or switch fallback)
     try {
-        const data = await bastiGet(`/getallmedia/${req.params.ch}`);
+        const data = await bastiGet(`/getallmedia/${ch}`);
         const media = Array.isArray(data.media) ? data.media : [];
-        res.json({ current: media[0] ?? null });
+        // If switch mode and requests is also empty, try mylist one more time
+        if (mode === 'switch' && media.length === 0) {
+            const listData = loadChannelMyList(ch);
+            return res.json({ current: listData.items[0] ? { ...listData.items[0], _source: 'mylist' } : null });
+        }
+        res.json({ current: media[0] ? { ...media[0], _source: 'requests' } : null });
     } catch {
         res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
     }
 });
 
-// Advance the queue (video ended in overlay)
+// Advance the queue (video ended in overlay) — respects play mode
 app.post('/api/channels/:ch/next', async (req, res) => {
+    const ch = req.params.ch;
+    const modeData = loadChannelMode(ch);
+    const { mode } = modeData;
+    const effectiveSource = mode === 'switch' ? modeData.switchTurn : mode;
+
+    const advanceMyList = () => {
+        const listData = loadChannelMyList(ch);
+        if (listData.items.length > 0) listData.items.shift();
+        saveChannelMyList(ch, listData);
+    };
+
+    if (effectiveSource === 'mylist') {
+        advanceMyList();
+        if (mode === 'switch') {
+            modeData.switchTurn = 'requests';
+            saveChannelMode(ch, modeData);
+        }
+        io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
+        return res.json({ success: true });
+    }
+
+    // requests source
     try {
-        await bastiPost(`/removemedia/${req.params.ch}/0`);
-        io.to(`ch:${req.params.ch}`).emit('queue:update', { channel: req.params.ch });
+        await bastiPost(`/removemedia/${ch}/0`);
+        if (mode === 'switch') {
+            modeData.switchTurn = 'mylist';
+            saveChannelMode(ch, modeData);
+        }
+        io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
         res.json({ success: true });
     } catch {
         res.status(502).json({ error: 'Could not reach api.bastiwood.com' });

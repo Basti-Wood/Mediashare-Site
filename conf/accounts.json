@@ -2,7 +2,7 @@
     "accounts": [
         {
             "username": "Basti",
-            "password": "your_password_here",
+            "password": "test",
             "channel": "basti_wood",
             "access_accounts": ["tuubaa"]
         },
