@@ -187,6 +187,23 @@ async function bastiPost(path) {
     return r.json();
 }
 
+// Owner songs are marked by setting the username to US + channel name
+// (e.g. channel "bastiwood" -> "USbastiwood"). The viewer-requests list filters
+// these out. NOTE: the Twitch bot reads the song TITLE, not the username, so a
+// username marker alone will NOT stop the bot pasting it — add a username check
+// in the bot too if that matters.
+function ownerUsernameFor(channel) {
+    return 'US' + String(channel || '');
+}
+
+function isOwnerSong(item, channel) {
+    if (!item) return false;
+    if (item.owner_song === true) return true;
+    const u = String(item.username || '');
+    // Match US<channel> exactly, or any US-prefixed owner username as a fallback.
+    return u === ownerUsernameFor(channel) || /^US./.test(u);
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function loadAccounts() {
@@ -270,7 +287,13 @@ function parseYouTubeVideoId(url) {
 
 function parseYouTubePlaylistId(url) {
     const m = String(url).match(/[?&]list=([A-Za-z0-9_-]+)/);
-    return m ? m[1] : null;
+    if (!m) return null;
+    // Radio/mix playlists (RD..., UL...) cannot be expanded via the API or scrape
+    // — ignore them so we fall through to single-video handling instead of
+    // storing a useless un-expandable stub.
+    const id = m[1];
+    if (/^(RD|UL)/.test(id)) return null;
+    return id;
 }
 
 async function resolveYouTubeVideoTitle(videoId) {
@@ -342,6 +365,21 @@ async function expandYouTubePlaylistViaScrape(playlistId) {
         }
 
         walk(parsed);
+
+        // ── Step 3: regex backstop ───────────────────────────────────────────
+        // ytInitialData sometimes only contains the first ~100 lazy-loaded
+        // entries, or YouTube changes the renderer shape. Sweep the raw HTML for
+        // any "videoId":"..." tokens we haven't already captured so long
+        // playlists aren't silently truncated.
+        const idRegex = /"videoId":"([A-Za-z0-9_-]{11})"/g;
+        let rm;
+        while ((rm = idRegex.exec(html)) !== null) {
+            const vid = rm[1];
+            if (seen.has(vid)) continue;
+            seen.add(vid);
+            items.push({ url: `https://www.youtube.com/watch?v=${vid}`, title: 'Unknown Title', platform: 'youtube', addedAt: now });
+        }
+
         console.log(`Scraped ${items.length} videos from playlist ${playlistId}`);
         return items.length > 0 ? items : null;
     } catch (e) { console.error('Playlist scrape error:', e.message); return null; }
@@ -359,9 +397,13 @@ async function expandYouTubePlaylist(playlistId) {
             let url = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId=${encodeURIComponent(playlistId)}&key=${encodeURIComponent(apiKey)}`;
             if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
             const r = await fetch(url);
-            if (!r.ok) break;
-            const data = await r.json();
-            if (data.error) { console.error('YouTube API error:', data.error.message); break; }
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok || data.error) {
+                const reason = data?.error?.errors?.[0]?.reason || data?.error?.message || `HTTP ${r.status}`;
+                console.error(`YouTube Data API failed for playlist ${playlistId}: ${reason}`);
+                console.error('  → Check: key is correct, "YouTube Data API v3" is ENABLED, and quota is not exhausted.');
+                break;
+            }
             for (const item of (data.items || [])) {
                 const videoId = item.snippet?.resourceId?.videoId;
                 const title   = item.snippet?.title;
@@ -376,7 +418,7 @@ async function expandYouTubePlaylist(playlistId) {
             }
             pageToken = data.nextPageToken || '';
             pages++;
-        } while (pageToken && pages < 4);
+        } while (pageToken && pages < 10);
         if (items.length > 0) return items;
     }
 
@@ -446,13 +488,20 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 
 // ── Media — proxy to api.bastiwood.com ───────────────────────────────────────
 
-// GET all media for an owner (dashboard)
+// GET all media for an owner (dashboard). Owner songs (pushed via add_media_top)
+// are filtered OUT of the viewer-requests list — they're shown only in Now Playing.
 app.get('/api/media/:owner', requireAuth, async (req, res) => {
     if (!hasAccess(req.session.user, req.params.owner))
         return res.status(403).json({ error: 'Access denied.' });
     try {
         const data = await bastiGet(`/getallmedia/${req.params.owner}`);
-        res.json(data);
+        const media = Array.isArray(data.media) ? data.media : [];
+        // Keep the currently-playing item (index 0) even if it's an owner song so
+        // Now Playing can show it; drop owner songs from the rest of the list.
+        const cleaned = media.filter((item, i) =>
+            i === 0 || !isOwnerSong(item, req.params.owner)
+        );
+        res.json({ ...data, media: cleaned });
     } catch {
         res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
     }
@@ -470,6 +519,28 @@ app.post('/api/media/:owner/remove/:index', requireAuth, async (req, res) => {
         res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
     }
 });
+
+// Push an OWNER song to the FRONT of the Basti queue (used when a My List song
+// becomes current). Calls Basti's /setmediatop route, which mirrors /setmedia
+// but inserts at index 0. The owner marker is the username (US<channel>); Basti
+// also tags it owner_song: true. Note Basti resolves the title itself.
+async function pushOwnerSongToBasti(channel, item) {
+    const rawUrl = item?.url || item?.media || '';
+    const user   = ownerUsernameFor(channel);   // US<channel> marks it as an owner song
+
+    // The /setmediatop/{...}/{media:path} route loses everything after '?',
+    // so a normal watch?v=ID URL arrives as '.../watch' with no id. To avoid
+    // that entirely, convert YouTube links to a query-free youtu.be/<id> form
+    // (Basti's set_media_top handles youtu.be via its '/'-split fallback).
+    let media = rawUrl;
+    const ytId = parseYouTubeVideoId(rawUrl);
+    if (ytId) {
+        media = `https://youtu.be/${ytId}`;
+    }
+
+    const encodedMedia = encodeURIComponent(media);
+    return bastiPost(`/setmediatop/${encodeURIComponent(channel)}/${encodeURIComponent(user)}/${encodedMedia}`);
+}
 
 // ── Personal list (stored locally per channel) ────────────────────────────────
 
@@ -490,26 +561,39 @@ app.post('/api/mylist/:owner/add', requireAuth, async (req, res) => {
     const rawUrl    = url.trim();
     const data      = loadChannelMyList(req.params.owner);
     const added     = [];
+    let   warning   = null;
     const now       = new Date().toISOString();
     const playlistId = parseYouTubePlaylistId(rawUrl);
 
     if (playlistId) {
-        // Any YouTube URL with a list= param → try to expand the full playlist
+        // Any YouTube URL with an expandable list= param → try the full playlist
         const expanded = await expandYouTubePlaylist(playlistId);
         if (expanded && expanded.length > 0) {
             data.items.push(...expanded);
             added.push(...expanded);
         } else {
-            // Could not expand (private/unavailable playlist) — store as stub
-            const entry = {
-                url:        rawUrl,
-                title:      `YouTube Playlist (${playlistId})`,
-                platform:   'youtube-playlist',
-                playlistId,
-                addedAt:    now
-            };
-            data.items.push(entry);
-            added.push(entry);
+            // Expansion failed (private/unavailable, or API+scrape both down).
+            // If the URL also pointed at a specific video, add THAT single video
+            // so the user at least gets the one they selected — never a dead stub.
+            const videoId = parseYouTubeVideoId(rawUrl);
+            if (videoId) {
+                const title = await resolveYouTubeVideoTitle(videoId) || 'Unknown Title';
+                const entry = { url: `https://www.youtube.com/watch?v=${videoId}`, title, platform: 'youtube', addedAt: now };
+                data.items.push(entry);
+                added.push(entry);
+                warning = 'Could not expand the playlist (add a YOUTUBE_API_KEY for reliable import) — added the single selected video instead.';
+            } else {
+                const entry = {
+                    url:        rawUrl,
+                    title:      `YouTube Playlist (${playlistId})`,
+                    platform:   'youtube-playlist',
+                    playlistId,
+                    addedAt:    now
+                };
+                data.items.push(entry);
+                added.push(entry);
+                warning = 'Could not expand the playlist — stored as a link only.';
+            }
         }
     } else {
         const videoId = parseYouTubeVideoId(rawUrl);
@@ -530,7 +614,7 @@ app.post('/api/mylist/:owner/add', requireAuth, async (req, res) => {
     }
 
     saveChannelMyList(req.params.owner, data);
-    res.json({ success: true, added, total: data.items.length });
+    res.json({ success: true, added, total: data.items.length, warning });
 });
 
 app.post('/api/mylist/:owner/remove/:index', requireAuth, (req, res) => {
@@ -571,67 +655,111 @@ app.post('/api/mode/:channel', requireAuth, (req, res) => {
     res.json({ success: true, mode });
 });
 
+// Tracks whether we've already pushed the head My List song to Basti for a
+// channel, so /current (which may be polled rapidly) doesn't push duplicates.
+const ownerPushInFlight = new Set();
+
+// Move the head My List item into the FRONT of the Basti queue, then drop it
+// from My List. Returns true if something was pushed.
+async function promoteMyListHeadToBasti(ch) {
+    const listData = loadChannelMyList(ch);
+    if (listData.items.length === 0) return false;
+    if (ownerPushInFlight.has(ch)) return false;
+
+    ownerPushInFlight.add(ch);
+    // Remove it from My List FIRST so the song is consumed exactly once. If we
+    // waited until after the Basti POST, a slow/failed call (bastiPost never
+    // throws on an HTTP error, only on a network fault) could leave the item in
+    // the list and replay it on the next poll. Snapshot it so we can restore it
+    // only if the network call genuinely fails.
+    const [head] = listData.items.splice(0, 1);
+    saveChannelMyList(ch, listData);
+
+    try {
+        await pushOwnerSongToBasti(ch, head);
+        io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
+        return true;
+    } catch (e) {
+        console.error(`Failed to push owner song to Basti for ${ch}:`, e.message || e);
+        // Network failure — put it back at the front so it isn't lost.
+        const current = loadChannelMyList(ch);
+        current.items.unshift(head);
+        saveChannelMyList(ch, current);
+        return false;
+    } finally {
+        ownerPushInFlight.delete(ch);
+    }
+}
+
 // ── Overlay endpoints (no auth — used by OBS browser source) ─────────────────
 
-// Get the current (first) item — respects play mode
+// Get the current (first) item — respects play mode.
+// For 'mylist'/'switch' sources, owner songs are routed THROUGH the Basti queue
+// (front row) so they appear in the top slot for the Twitch bot. We push the
+// head My List item to Basti, then always read the current item from Basti.
 app.get('/api/channels/:ch/current', async (req, res) => {
     const ch = req.params.ch;
     const modeData = loadChannelMode(ch);
     const { mode } = modeData;
     const effectiveSource = mode === 'switch' ? modeData.switchTurn : mode;
 
-    if (effectiveSource === 'mylist') {
-        const listData = loadChannelMyList(ch);
-        // fall back to requests if mylist is empty in switch mode
-        if (listData.items.length > 0) {
-            return res.json({ current: { ...listData.items[0], _source: 'mylist' } });
-        }
-        if (mode !== 'switch') return res.json({ current: null });
-    }
-
-    // requests source (or switch fallback)
     try {
-        const data = await bastiGet(`/getallmedia/${ch}`);
-        const media = Array.isArray(data.media) ? data.media : [];
-        // If switch mode and requests is also empty, try mylist one more time
-        if (mode === 'switch' && media.length === 0) {
-            const listData = loadChannelMyList(ch);
-            return res.json({ current: listData.items[0] ? { ...listData.items[0], _source: 'mylist' } : null });
+        let media = [];
+        try {
+            const data = await bastiGet(`/getallmedia/${ch}`);
+            media = Array.isArray(data.media) ? data.media : [];
+        } catch {
+            return res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
         }
-        res.json({ current: media[0] ? { ...media[0], _source: 'requests' } : null });
-    } catch {
+
+        const topIsOwner = isOwnerSong(media[0], ch);
+
+        // Viewer-request songs available right now = anything in the Basti queue
+        // that isn't an owner (My List) song.
+        const hasViewerSong = media.some(item => !isOwnerSong(item, ch));
+        const hasMyListSong = loadChannelMyList(ch).items.length > 0;
+
+        // Decide whether to promote a My List song into Basti's front row now:
+        //  - 'mylist' mode : always prefer My List.
+        //  - 'switch' mode : when it's My List's turn (effectiveSource === 'mylist').
+        //  - ANY mode      : automatic fallback — if there's no viewer song to
+        //                    play but a personal-list song exists, promote it so
+        //                    the overlay never dead-ends on an empty viewer list.
+        const wantMyList =
+            !topIsOwner && hasMyListSong &&
+            (effectiveSource === 'mylist' || !hasViewerSong);
+
+        if (wantMyList) {
+            const pushed = await promoteMyListHeadToBasti(ch);
+            if (pushed) {
+                const data = await bastiGet(`/getallmedia/${ch}`);
+                media = Array.isArray(data.media) ? data.media : [];
+            }
+        }
+
+        const current = media[0]
+            ? { ...media[0], _source: isOwnerSong(media[0], ch) ? 'mylist' : 'requests' }
+            : null;
+        res.json({ current });
+    } catch (e) {
+        console.error('current failed:', e.message || e);
         res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
     }
 });
 
-// Advance the queue (video ended in overlay) — respects play mode
+// Advance the queue (video ended in overlay).
+// Everything (owner songs included) now lives in the Basti queue, so advancing
+// is simply removing index 0 from Basti. In 'switch' mode we flip whose turn is
+// next so the following /current call promotes a My List song (or not).
 app.post('/api/channels/:ch/next', async (req, res) => {
     const ch = req.params.ch;
     const modeData = loadChannelMode(ch);
     const { mode } = modeData;
-    const effectiveSource = mode === 'switch' ? modeData.switchTurn : mode;
 
-    const advanceMyList = () => {
-        const listData = loadChannelMyList(ch);
-        if (listData.items.length > 0) listData.items.shift();
-        saveChannelMyList(ch, listData);
-    };
-
-    if (effectiveSource === 'mylist') {
-        advanceMyList();
-        if (mode === 'switch') {
-            modeData.switchTurn = 'requests';
-            saveChannelMode(ch, modeData);
-        }
-        io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
-        return res.json({ success: true });
-    }
-
-    // requests source
     try {
         await bastiPost(`/removemedia/${ch}/0`);
         if (mode === 'switch') {
-            modeData.switchTurn = 'mylist';
+            modeData.switchTurn = modeData.switchTurn === 'mylist' ? 'requests' : 'mylist';
             saveChannelMode(ch, modeData);
         }
         io.to(`ch:${ch}`).emit('queue:update', { channel: ch });

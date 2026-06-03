@@ -30,6 +30,17 @@
 
 .dashboard-columns {
     height: calc(100vh - 110px);
+    min-height: 0;
+}
+
+/* Bulma columns don't pass height down by default; force the columns and the
+   inner boxes to fill the row so .queue-box keeps its height when content
+   changes (otherwise the box collapses and the tab selector vanishes). */
+.dashboard-columns > .column {
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
 }
 
 .preview-box,
@@ -37,7 +48,8 @@
     background: #1e1e1e;
     border: 1px solid #333;
     border-radius: 6px;
-    height: 100%;
+    flex: 1;
+    min-height: 0;
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -53,6 +65,7 @@
 
 .queue-box {
     overflow-y: auto;
+    overflow-x: hidden;
 }
 
 .now-playing-card {
@@ -111,6 +124,30 @@
 /* ── Queue-type tabs (inside queue box) ────────────────────── */
 #queue-type-tabs.tabs.is-boxed {
     margin-bottom: 0.75rem;
+    background: #1e1e1e;
+    /* The queue box is a flex column; without this the tab bar gets squeezed to
+       zero height (and visually disappears) when the list below it grows. */
+    flex-shrink: 0;
+}
+
+/* Keep every fixed header element above the lists from being compressed when a
+   panel's table grows. Only the panels themselves should scroll/shrink. */
+.queue-box > .heading,
+.queue-box > #now-playing-info,
+.queue-box > #skip-current-btn,
+.queue-box > .queue-divider,
+.queue-box > .level {
+    flex-shrink: 0;
+}
+
+/* The two panels share the leftover space and scroll internally instead of
+   pushing the tab bar off-screen. */
+#panel-requests,
+#panel-mylist {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
 }
 #queue-type-tabs.tabs.is-boxed ul {
     border-bottom-color: #333;

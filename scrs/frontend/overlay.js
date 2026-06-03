@@ -76,13 +76,16 @@ if (CONTROLS) {
     seekBar.addEventListener('input', () => {
         if (!ytPlayer || typeof ytPlayer.getDuration !== 'function') return;
         const dur = ytPlayer.getDuration();
+        if (!dur || isNaN(dur)) return;
         const sec = (seekBar.value / 100) * dur;
         timeDisplay.textContent = `${formatTime(sec)} / ${formatTime(dur)}`;
     });
     seekBar.addEventListener('change', () => {
         isSeeking = false;
         if (!ytPlayer || typeof ytPlayer.seekTo !== 'function') return;
-        ytPlayer.seekTo((seekBar.value / 100) * ytPlayer.getDuration(), true);
+        const dur = ytPlayer.getDuration();
+        if (!dur || isNaN(dur)) return;
+        ytPlayer.seekTo((seekBar.value / 100) * dur, true);
     });
 
     // Volume
@@ -102,9 +105,12 @@ function clearYouTubeFallbackTimer() {
 }
 
 function fallbackEmbed(videoId) {
-    const src = `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?autoplay=1&controls=0&rel=0&modestbranding=1&playsinline=1`;
+    // Use enablejsapi=1 so we can still drive seek/volume from the controls.
+    const origin = encodeURIComponent(window.location.origin);
+    const src = `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?enablejsapi=1&autoplay=1&controls=0&rel=0&modestbranding=1&playsinline=1&origin=${origin}`;
     ytContainer.innerHTML = `
         <iframe
+            id="yt-fallback-iframe"
             data-fallback="1"
             width="100%"
             height="100%"
@@ -114,6 +120,39 @@ function fallbackEmbed(videoId) {
             allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
             referrerpolicy="strict-origin-when-cross-origin">
         </iframe>`;
+
+    // If the JS API is (or becomes) available, attach a player to the fallback
+    // iframe so the seek/volume sliders keep working instead of silently dying.
+    const attach = () => {
+        if (typeof YT === 'undefined' || !YT.Player) return false;
+        try {
+            ytPlayer = new YT.Player('yt-fallback-iframe', {
+                events: {
+                    onReady(event) {
+                        event.target.unMute();
+                        if (CONTROLS && volumeBar) event.target.setVolume(Number(volumeBar.value));
+                        startPoll();
+                    },
+                    onStateChange(event) {
+                        if (event.data === YT.PlayerState.ENDED) advance();
+                        if (CONTROLS) {
+                            if (event.data === YT.PlayerState.PLAYING) startPoll();
+                            else if (event.data === YT.PlayerState.PAUSED ||
+                                     event.data === YT.PlayerState.ENDED)  stopPoll();
+                        }
+                    }
+                }
+            });
+            return true;
+        } catch { return false; }
+    };
+    if (!attach()) {
+        // YT script not parsed yet — retry briefly.
+        let tries = 0;
+        const t = setInterval(() => {
+            if (attach() || ++tries > 20) clearInterval(t);
+        }, 250);
+    }
 }
 
 function scheduleFallback(videoId) {
@@ -201,7 +240,9 @@ function playYouTube(videoId) {
                 playsinline:    1,
                 controls:       0,
                 rel:            0,
-                modestbranding: 1
+                modestbranding: 1,
+                enablejsapi:    1,
+                origin:         window.location.origin
             },
             events: {
                 onReady(event) {

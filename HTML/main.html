@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mediashare — Dashboard</title>
     <link rel="stylesheet" href="../styles/bulma/css/bulma.min.css">
-    <link rel="stylesheet" href="../styles/mystyles.css">
+    <link rel="stylesheet" href="../styles/mystyles.css?v=fix-6">
 </head>
-<body class="dashboard-body">
+<body class="dashboard-body" data-build="fix-6">
 
     <!-- ── Navbar ──────────────────────────────────────────────────────────── -->
     <nav class="navbar is-dark" role="navigation">
@@ -53,9 +53,12 @@
 
                 <!-- Now playing -->
                 <p class="heading mb-2">Now Playing</p>
-                <div id="now-playing-info" class="mb-4">
+                <div id="now-playing-info" class="mb-2">
                     <span class="has-text-grey">Nothing playing.</span>
                 </div>
+                <button id="skip-current-btn" class="button is-warning is-fullwidth mb-4">
+                    ⏭ Skip current song
+                </button>
 
                 <hr class="queue-divider">
 

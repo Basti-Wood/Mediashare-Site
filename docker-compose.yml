@@ -9,4 +9,11 @@ services:
     volumes:
       # mount conf/ so you can edit accounts without rebuilding the image
       - ./conf:/app/conf:ro
+      # mount source + static assets so code edits take effect on a plain
+      # restart (docker-compose restart) without rebuilding the image.
+      - ./scrs:/app/scrs:ro
+      - ./HTML:/app/HTML:ro
+      - ./src:/app/src:ro
+      - ./styles:/app/styles:ro
+      - ./index.html:/app/index.html:ro
     restart: unless-stopped

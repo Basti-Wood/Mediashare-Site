@@ -1,5 +1,13 @@
 'use strict';
 
+// Surface ANY uncaught error loudly so we can diagnose the vanishing selector.
+window.addEventListener('error', e => {
+    console.error('[main.js uncaught]', e.message, 'at', e.filename + ':' + e.lineno);
+});
+window.addEventListener('unhandledrejection', e => {
+    console.error('[main.js unhandled promise]', e.reason);
+});
+
 let currentChannel = null;
 let socket         = null;
 let user           = null;
@@ -13,6 +21,7 @@ const tabList         = document.getElementById('channel-tab-list');
 const previewFrame    = document.getElementById('preview-frame');
 const overlayUrl      = document.getElementById('overlay-url');
 const nowPlaying      = document.getElementById('now-playing-info');
+const skipCurrentBtn  = document.getElementById('skip-current-btn');
 const queueCount      = document.getElementById('queue-count');
 const queueEmpty      = document.getElementById('queue-empty');
 const queueTable      = document.getElementById('queue-table');
@@ -68,7 +77,7 @@ function getThumbnailHtml(item) {
 }
 
 function renderTitle(item) {
-    const title = esc(item?.song_name || 'Unknown Title');
+    const title = esc(item?.song_name || item?.title || 'Unknown Title');
     const url = getMediaUrl(item);
     if (!url) return `<span class="media-link">${title}</span>`;
     return `<a class="media-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Open media link">${title}</a>`;
@@ -178,8 +187,13 @@ async function addToMyList(url) {
             mylistAddStatus.textContent = data.error || 'Failed to add.';
         } else {
             const n = data.added?.length ?? 1;
-            mylistAddStatus.className = 'is-size-7 mb-3 has-text-success';
-            mylistAddStatus.textContent = `Added ${n} song${n !== 1 ? 's' : ''}.`;
+            if (data.warning) {
+                mylistAddStatus.className = 'is-size-7 mb-3 has-text-warning';
+                mylistAddStatus.textContent = `Added ${n} song${n !== 1 ? 's' : ''}. ${data.warning}`;
+            } else {
+                mylistAddStatus.className = 'is-size-7 mb-3 has-text-success';
+                mylistAddStatus.textContent = `Added ${n} song${n !== 1 ? 's' : ''}.`;
+            }
             mylistUrlInput.value = '';
             await loadMyList();
         }
@@ -230,16 +244,18 @@ function renderMedia(media) {
 
     // Now playing
     if (current) {
+        // My List items use .title/.platform; viewer items use .song_name/.Platform.
+        const by = current.username ? `by ${esc(current.username)}` : '';
         nowPlaying.innerHTML = `
             <div class="now-playing-card">
                 ${getThumbnailHtml(current)}
-                ${platformTag(current.Platform)}
+                ${platformTag(current.Platform || current.platform)}
                 <span class="now-playing-title">${renderTitle(current)}</span>
-                <span class="now-playing-user">by ${esc(current.username)}</span>
+                <span class="now-playing-user">${by}</span>
                 <button class="button is-danger is-small ml-auto skip-btn" title="Skip">✕ Skip</button>
             </div>`;
-        nowPlaying.querySelector('.skip-btn')
-            .addEventListener('click', () => removeMedia(0));
+        const skipBtn = nowPlaying.querySelector('.skip-btn');
+        if (skipBtn) skipBtn.addEventListener('click', () => removeMedia(0));
     } else {
         nowPlaying.innerHTML = '<span class="has-text-grey">Nothing playing.</span>';
     }
@@ -299,6 +315,24 @@ async function removeMedia(index) {
     }
 }
 
+// Skip the currently-playing song: advance the overlay queue (removes index 0
+// from Basti and moves to the next item, owner songs included).
+async function skipCurrent() {
+    if (!currentChannel) return;
+    skipCurrentBtn.disabled = true;
+    try {
+        await fetch(`/api/channels/${encodeURIComponent(currentChannel)}/next`,
+                    { method: 'POST' });
+        // queue:update via socket.io refreshes the dashboard + overlay.
+    } catch (e) {
+        console.error('Failed to skip current song', e);
+    } finally {
+        skipCurrentBtn.disabled = false;
+    }
+}
+
+if (skipCurrentBtn) skipCurrentBtn.addEventListener('click', skipCurrent);
+
 // ── Channel switching ─────────────────────────────────────────────────────────
 
 function switchChannel(channel) {
@@ -348,7 +382,14 @@ async function init() {
 
     socket = io();
     socket.on('connect', () => { if (currentChannel) socket.emit('join:channel', currentChannel); });
-    socket.on('queue:update', ({ channel }) => { if (channel === currentChannel) loadMedia(); });
+    socket.on('queue:update', ({ channel }) => {
+        if (channel !== currentChannel) return;
+        loadMedia();
+        // A promoted My List song is consumed from the personal list server-side,
+        // so refresh that view too when it's open — otherwise the finished/started
+        // song lingers on screen until the user switches tabs.
+        if (activeQueueTab === 'mylist') loadMyList();
+    });
 
     setupQueueTypeTabs();
     switchChannel(channels[0]);
