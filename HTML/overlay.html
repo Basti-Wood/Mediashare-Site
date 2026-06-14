@@ -2,6 +2,36 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <!--
+      Background-tab pause fix — MUST be the first script in <head>.
+      A background tab reports document.visibilityState === "hidden". The
+      cross-origin YouTube iframe reads the TOP document's visibility and pauses
+      its media when hidden, which is what stopped playback when this page wasn't
+      the active tab. We can't touch the cross-origin iframe's audio, so we pin
+      the page to always *report* itself visible. This runs before the YouTube
+      iframe_api script so YouTube's own visibility listener only ever sees
+      "visible". overlay.js re-asserts this defensively and also suppresses the
+      visibilitychange event. The real OS tab state is unchanged; only the
+      JS-observable signal is overridden.
+    -->
+    <script>
+        (function () {
+            try {
+                Object.defineProperty(document, 'visibilityState', {
+                    configurable: true, get: function () { return 'visible'; }
+                });
+                Object.defineProperty(document, 'hidden', {
+                    configurable: true, get: function () { return false; }
+                });
+                document.addEventListener('visibilitychange', function (e) {
+                    e.stopImmediatePropagation();
+                }, true);
+                window.addEventListener('visibilitychange', function (e) {
+                    e.stopImmediatePropagation();
+                }, true);
+            } catch (err) { /* non-fatal */ }
+        })();
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mediashare Overlay</title>
     <style>
@@ -139,6 +169,6 @@
     <script src="/socket.io/socket.io.js"></script>
     <!-- YouTube IFrame API -->
     <script src="https://www.youtube.com/iframe_api"></script>
-    <script src="../scrs/frontend/overlay.js?v=bg-1"></script>
+    <script src="../scrs/frontend/overlay.js?v=bg-3"></script>
 </body>
 </html>

@@ -50,48 +50,55 @@ document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && !wakeLock) requestWakeLock();
 });
 
-// ── Silent audio keep-alive ───────────────────────────────────────────────────
-// The real reason playback dies in a background/minimised tab isn't timer
-// throttling — it's that the browser suspends the YouTube iframe's media once the
-// page loses visibility and isn't itself producing audio. We keep a near-silent
-// Web Audio oscillator running so this page counts as actively playing audio; the
-// browser then leaves the tab (and the YouTube iframe inside it) running in the
-// background instead of pausing it. The gain is effectively inaudible (0.0001) so
-// it never touches the stream mix. AudioContext often starts "suspended" until a
-// user gesture, so we also resume it on the first interaction and on tab-show.
-let keepAliveCtx = null;
-
-function startSilentKeepAlive() {
+// ── Background-tab pause prevention (visibility spoof) ─────────────────────────
+// When this page becomes a background tab, the browser flips document visibility
+// to "hidden". The cross-origin YouTube iframe reads the TOP document's
+// visibility and pauses its media when it goes hidden — that's what stopped
+// playback. We can't reach into the cross-origin iframe to capture or control its
+// audio, so instead we make this page permanently *report* itself as visible:
+// override document.visibilityState / document.hidden to constant "visible"
+// values and swallow the visibilitychange event so nothing downstream (including
+// YouTube's own visibility listener, which is installed when the iframe loads)
+// ever sees the tab go hidden. The real OS-level tab state is unaffected; only
+// the JS-observable signal is pinned.
+//
+// NOTE: For this to cover YouTube's listener, it must run BEFORE the iframe_api
+// script loads. The matching inline shim in overlay.html runs first and installs
+// the property overrides; this block only adds the event-suppression layer and is
+// safe (idempotent) even if the inline shim already ran.
+(function pinVisibilityVisible() {
     try {
-        if (!keepAliveCtx) {
-            const Ctx = window.AudioContext || window.webkitAudioContext;
-            if (!Ctx) return;
-            keepAliveCtx = new Ctx();
-            const osc  = keepAliveCtx.createOscillator();
-            const gain = keepAliveCtx.createGain();
-            gain.gain.value     = 0.0001;   // inaudible but non-zero
-            osc.frequency.value = 440;
-            osc.connect(gain);
-            gain.connect(keepAliveCtx.destination);
-            osc.start();
+        // Property overrides (the inline <head> shim normally does this first; we
+        // re-assert defensively in case overlay.js is loaded standalone).
+        if (Object.getOwnPropertyDescriptor(document, 'visibilityState') === undefined ||
+            document.visibilityState !== 'visible') {
+            Object.defineProperty(document, 'visibilityState', {
+                configurable: true, get() { return 'visible'; }
+            });
         }
-        if (keepAliveCtx.state === 'suspended') keepAliveCtx.resume().catch(() => {});
-    } catch { /* keep-alive not critical — ignore */ }
-}
+        if (document.hidden !== false) {
+            Object.defineProperty(document, 'hidden', {
+                configurable: true, get() { return false; }
+            });
+        }
+    } catch { /* some browsers may refuse redefinition — non-fatal */ }
 
-// Browsers may hold the AudioContext suspended until a user gesture. Resume it on
-// the first interaction and whenever the tab becomes visible again.
-['click', 'keydown', 'touchstart', 'pointerdown'].forEach(ev =>
-    window.addEventListener(ev, startSilentKeepAlive, { passive: true }));
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') startSilentKeepAlive();
-});
+    // Stop the visibilitychange event from propagating to other listeners
+    // (notably YouTube's, inside the iframe-driving API) during the capture phase.
+    window.addEventListener('visibilitychange', e => {
+        e.stopImmediatePropagation();
+    }, true);
+    document.addEventListener('visibilitychange', e => {
+        e.stopImmediatePropagation();
+    }, true);
+})();
 
 function startWatchdog() {
     if (watchdogTimer) return;
-    // 1000ms is throttled to ~once/minute when hidden, but YouTube keeps playing
-    // audio in the background, so catching the end within a minute is acceptable
-    // and the queue never stalls. When visible it fires every second as normal.
+    // With visibility pinned to "visible" the iframe keeps playing in a background
+    // tab and timers are not throttled, so the ENDED event fires normally. The
+    // watchdog stays as a belt-and-braces backstop in case a browser still defers
+    // the event; it advances the queue if a video reaches its end regardless.
     watchdogTimer = setInterval(() => {
         if (advancing || !ytPlayer) return;
         if (typeof ytPlayer.getCurrentTime !== 'function') return;
@@ -218,7 +225,6 @@ function fallbackEmbed(videoId) {
                         if (CONTROLS && volumeBar) event.target.setVolume(Number(volumeBar.value));
                         startPoll();
                         startWatchdog();
-                        startSilentKeepAlive();
                     },
                     onStateChange(event) {
                         if (event.data === YT.PlayerState.ENDED) advance();
@@ -343,7 +349,6 @@ function playYouTube(videoId) {
                     event.target.playVideo();
                     startPoll();
                     startWatchdog();
-                    startSilentKeepAlive();
                 },
                 onStateChange(event) {
                     if (event.data === YT.PlayerState.ENDED) advance();
