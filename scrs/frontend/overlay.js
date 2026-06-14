@@ -50,6 +50,43 @@ document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && !wakeLock) requestWakeLock();
 });
 
+// ── Silent audio keep-alive ───────────────────────────────────────────────────
+// The real reason playback dies in a background/minimised tab isn't timer
+// throttling — it's that the browser suspends the YouTube iframe's media once the
+// page loses visibility and isn't itself producing audio. We keep a near-silent
+// Web Audio oscillator running so this page counts as actively playing audio; the
+// browser then leaves the tab (and the YouTube iframe inside it) running in the
+// background instead of pausing it. The gain is effectively inaudible (0.0001) so
+// it never touches the stream mix. AudioContext often starts "suspended" until a
+// user gesture, so we also resume it on the first interaction and on tab-show.
+let keepAliveCtx = null;
+
+function startSilentKeepAlive() {
+    try {
+        if (!keepAliveCtx) {
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) return;
+            keepAliveCtx = new Ctx();
+            const osc  = keepAliveCtx.createOscillator();
+            const gain = keepAliveCtx.createGain();
+            gain.gain.value     = 0.0001;   // inaudible but non-zero
+            osc.frequency.value = 440;
+            osc.connect(gain);
+            gain.connect(keepAliveCtx.destination);
+            osc.start();
+        }
+        if (keepAliveCtx.state === 'suspended') keepAliveCtx.resume().catch(() => {});
+    } catch { /* keep-alive not critical — ignore */ }
+}
+
+// Browsers may hold the AudioContext suspended until a user gesture. Resume it on
+// the first interaction and whenever the tab becomes visible again.
+['click', 'keydown', 'touchstart', 'pointerdown'].forEach(ev =>
+    window.addEventListener(ev, startSilentKeepAlive, { passive: true }));
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') startSilentKeepAlive();
+});
+
 function startWatchdog() {
     if (watchdogTimer) return;
     // 1000ms is throttled to ~once/minute when hidden, but YouTube keeps playing
@@ -181,6 +218,7 @@ function fallbackEmbed(videoId) {
                         if (CONTROLS && volumeBar) event.target.setVolume(Number(volumeBar.value));
                         startPoll();
                         startWatchdog();
+                        startSilentKeepAlive();
                     },
                     onStateChange(event) {
                         if (event.data === YT.PlayerState.ENDED) advance();
@@ -305,6 +343,7 @@ function playYouTube(videoId) {
                     event.target.playVideo();
                     startPoll();
                     startWatchdog();
+                    startSilentKeepAlive();
                 },
                 onStateChange(event) {
                     if (event.data === YT.PlayerState.ENDED) advance();
