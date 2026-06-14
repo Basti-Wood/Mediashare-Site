@@ -25,6 +25,54 @@ let skipItemId     = null;   // ID of last removed item — skip if it comes bac
 let finishedItemId = null;   // ID of last *finished/empty* item — never replay it
 let ytFallbackTimer = null;
 
+// ── Background-throttle survival ──────────────────────────────────────────────
+// When this page is minimised or its tab is hidden, browsers throttle timers and
+// the YouTube iframe sometimes never fires its ENDED event — so the queue would
+// dead-end on the current song. The watchdog below polls the player position on
+// its own timer (independent of the controls poll) and advances the queue when a
+// video reaches its end, even if the ENDED event is suppressed. A Wake Lock is
+// also requested to reduce throttling while the overlay is open.
+let watchdogTimer  = null;
+let advancing      = false;   // guards against double-advance (event + watchdog)
+let wakeLock       = null;
+
+async function requestWakeLock() {
+    try {
+        if ('wakeLock' in navigator && navigator.wakeLock.request) {
+            wakeLock = await navigator.wakeLock.request('screen');
+            wakeLock.addEventListener('release', () => { wakeLock = null; });
+        }
+    } catch { /* wake lock not critical — ignore */ }
+}
+
+// Re-acquire the wake lock if it was dropped (e.g. on tab hide/show).
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !wakeLock) requestWakeLock();
+});
+
+function startWatchdog() {
+    if (watchdogTimer) return;
+    // 1000ms is throttled to ~once/minute when hidden, but YouTube keeps playing
+    // audio in the background, so catching the end within a minute is acceptable
+    // and the queue never stalls. When visible it fires every second as normal.
+    watchdogTimer = setInterval(() => {
+        if (advancing || !ytPlayer) return;
+        if (typeof ytPlayer.getCurrentTime !== 'function') return;
+        if (typeof ytPlayer.getDuration   !== 'function') return;
+        const state = typeof ytPlayer.getPlayerState === 'function'
+            ? ytPlayer.getPlayerState() : -1;
+        if (state === YT.PlayerState.ENDED) { advance(); return; }
+        const dur = ytPlayer.getDuration();
+        const cur = ytPlayer.getCurrentTime();
+        // Within 0.6s of the end and effectively stopped progressing → treat as done.
+        if (dur > 0 && cur > 0 && dur - cur <= 0.6) advance();
+    }, 1000);
+}
+
+function stopWatchdog() {
+    if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
+}
+
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
 const idleScreen    = document.getElementById('idle-screen');
@@ -132,6 +180,7 @@ function fallbackEmbed(videoId) {
                         event.target.unMute();
                         if (CONTROLS && volumeBar) event.target.setVolume(Number(volumeBar.value));
                         startPoll();
+                        startWatchdog();
                     },
                     onStateChange(event) {
                         if (event.data === YT.PlayerState.ENDED) advance();
@@ -167,6 +216,8 @@ function scheduleFallback(videoId) {
 
 async function advance() {
     if (!CHANNEL) return;
+    if (advancing) return;           // already advancing (event + watchdog race)
+    advancing      = true;
     skipItemId     = currentItemId;  // remember removed item so we don't replay it
     finishedItemId = currentItemId;  // and never auto-replay the finished item
     currentItemId  = null;
@@ -178,6 +229,8 @@ async function advance() {
     } catch (e) {
         console.error('Failed to advance queue', e);
         skipItemId = null;
+    } finally {
+        advancing = false;
     }
 }
 
@@ -203,6 +256,7 @@ function showIdle() {
     destroyYouTubePlayer();          // clear completely — no lingering replayable video
     currentItemId = null;
     stopPoll();
+    stopWatchdog();
     if (CONTROLS && seekBar)     { seekBar.value = 0; seekBar.disabled = false; }
     if (CONTROLS && timeDisplay) timeDisplay.textContent = '0:00 / 0:00';
 }
@@ -250,6 +304,7 @@ function playYouTube(videoId) {
                     if (CONTROLS && volumeBar) event.target.setVolume(Number(volumeBar.value));
                     event.target.playVideo();
                     startPoll();
+                    startWatchdog();
                 },
                 onStateChange(event) {
                     if (event.data === YT.PlayerState.ENDED) advance();
@@ -353,6 +408,18 @@ if (CHANNEL) {
         if (payload.channel && payload.channel !== CHANNEL) return;
         fetchAndPlay();
     });
+
+    // Safety re-sync: if a queue:update socket message is ever missed (e.g. while
+    // the tab was hidden and the socket briefly slept), this low-frequency poll
+    // re-checks the current item so the overlay self-heals. playItem() is a no-op
+    // when the current item is already playing, so this is cheap. Throttled to
+    // ~once/minute when hidden, which is fine as a backstop.
+    setInterval(() => {
+        if (!advancing) fetchAndPlay();
+    }, 10000);
+
+    // Reduce background throttling while the overlay is open (best-effort).
+    requestWakeLock();
 }
 
 fetchAndPlay();
