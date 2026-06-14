@@ -364,24 +364,43 @@ function switchChannel(channel) {
     if (activeQueueTab === 'mylist') loadMyList();
 }
 
-// Copy the OBS browser-source URL to the clipboard.
+// Copy the OBS browser-source URL to the clipboard. Works on HTTPS/localhost via
+// the async Clipboard API; falls back to execCommand('copy') on plain-http LAN
+// origins where navigator.clipboard is undefined, and finally to selecting the
+// field so the user can copy manually. Always gives visible feedback.
 if (copyObsUrlBtn) {
     copyObsUrlBtn.addEventListener('click', async () => {
         if (!currentOverlayUrl) return;
+
+        let copied = false;
         try {
-            await navigator.clipboard.writeText(currentOverlayUrl);
-        } catch {
-            // Clipboard API can be blocked on non-HTTPS / no focus — fall back
-            // to selecting the field so the user can copy manually.
-            if (overlayUrlInput) { overlayUrlInput.focus(); overlayUrlInput.select(); }
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(currentOverlayUrl);
+                copied = true;
+            }
+        } catch { /* fall through to legacy path */ }
+
+        if (!copied && overlayUrlInput) {
+            // Legacy fallback for non-secure contexts (http://192.168.x.x etc.)
+            overlayUrlInput.focus();
+            overlayUrlInput.select();
+            overlayUrlInput.setSelectionRange(0, currentOverlayUrl.length);
+            try { copied = document.execCommand('copy'); } catch { copied = false; }
         }
+
         const original = copyObsUrlBtn.textContent;
-        copyObsUrlBtn.textContent = 'Copied!';
-        copyObsUrlBtn.classList.add('is-success');
+        if (copied) {
+            copyObsUrlBtn.textContent = 'Copied!';
+            copyObsUrlBtn.classList.add('is-success');
+        } else {
+            // Couldn't auto-copy — leave it selected and tell the user.
+            copyObsUrlBtn.textContent = 'Press Ctrl+C';
+            copyObsUrlBtn.classList.add('is-warning');
+        }
         setTimeout(() => {
             copyObsUrlBtn.textContent = original;
-            copyObsUrlBtn.classList.remove('is-success');
-        }, 1500);
+            copyObsUrlBtn.classList.remove('is-success', 'is-warning');
+        }, 1800);
     });
 }
 
