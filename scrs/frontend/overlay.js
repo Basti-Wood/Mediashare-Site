@@ -17,7 +17,18 @@ const params  = new URLSearchParams(window.location.search);
 const CHANNEL   = (params.get('channel') || '').trim();
 const CONTROLS  = params.get('controls') === '1';
 
-let ytPlayer       = null;
+// Audio-mode switch: by default YouTube playback now runs through a same-origin
+// <audio> element fed by the server's yt-dlp resolver (/api/yt-audio/:id). A
+// native audio element is NOT suspended by the browser in a background tab, which
+// is what kept stopping playback (the old YouTube iframe gets paused when hidden,
+// especially in Brave). The muted YouTube iframe is kept ONLY to show the video
+// picture when the tab is visible; the audio element is the playback authority
+// (timing, volume, seek, and end-of-track all come from it).
+//
+// Append &ytmode=iframe to fall back to the old iframe-audio behaviour if needed.
+const YT_AUDIO_MODE = params.get('ytmode') !== 'iframe';
+
+let ytPlayer       = null;   // muted iframe player (video picture only, in audio mode)
 let ytApiReady     = false;
 let pendingVideoId = null;   // loaded before API was ready
 let currentItemId  = null;
@@ -26,12 +37,8 @@ let finishedItemId = null;   // ID of last *finished/empty* item — never repla
 let ytFallbackTimer = null;
 
 // ── Background-throttle survival ──────────────────────────────────────────────
-// When this page is minimised or its tab is hidden, browsers throttle timers and
-// the YouTube iframe sometimes never fires its ENDED event — so the queue would
-// dead-end on the current song. The watchdog below polls the player position on
-// its own timer (independent of the controls poll) and advances the queue when a
-// video reaches its end, even if the ENDED event is suppressed. A Wake Lock is
-// also requested to reduce throttling while the overlay is open.
+// The native <audio> element keeps playing in a background tab on its own, and a
+// Wake Lock is requested to further reduce throttling while the overlay is open.
 let watchdogTimer  = null;
 let advancing      = false;   // guards against double-advance (event + watchdog)
 let wakeLock       = null;
@@ -51,25 +58,12 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ── Background-tab pause prevention (visibility spoof) ─────────────────────────
-// When this page becomes a background tab, the browser flips document visibility
-// to "hidden". The cross-origin YouTube iframe reads the TOP document's
-// visibility and pauses its media when it goes hidden — that's what stopped
-// playback. We can't reach into the cross-origin iframe to capture or control its
-// audio, so instead we make this page permanently *report* itself as visible:
-// override document.visibilityState / document.hidden to constant "visible"
-// values and swallow the visibilitychange event so nothing downstream (including
-// YouTube's own visibility listener, which is installed when the iframe loads)
-// ever sees the tab go hidden. The real OS-level tab state is unaffected; only
-// the JS-observable signal is pinned.
-//
-// NOTE: For this to cover YouTube's listener, it must run BEFORE the iframe_api
-// script loads. The matching inline shim in overlay.html runs first and installs
-// the property overrides; this block only adds the event-suppression layer and is
-// safe (idempotent) even if the inline shim already ran.
+// Kept as defence-in-depth for the muted video iframe so its picture doesn't stall
+// when the tab is hidden. The native <audio> element does not need this, but it's
+// harmless. The matching inline shim in overlay.html runs before the iframe_api
+// script so YouTube's own visibility listener only ever sees "visible".
 (function pinVisibilityVisible() {
     try {
-        // Property overrides (the inline <head> shim normally does this first; we
-        // re-assert defensively in case overlay.js is loaded standalone).
         if (Object.getOwnPropertyDescriptor(document, 'visibilityState') === undefined ||
             document.visibilityState !== 'visible') {
             Object.defineProperty(document, 'visibilityState', {
@@ -83,8 +77,6 @@ document.addEventListener('visibilitychange', () => {
         }
     } catch { /* some browsers may refuse redefinition — non-fatal */ }
 
-    // Stop the visibilitychange event from propagating to other listeners
-    // (notably YouTube's, inside the iframe-driving API) during the capture phase.
     window.addEventListener('visibilitychange', e => {
         e.stopImmediatePropagation();
     }, true);
@@ -93,35 +85,19 @@ document.addEventListener('visibilitychange', () => {
     }, true);
 })();
 
-function startWatchdog() {
-    if (watchdogTimer) return;
-    // With visibility pinned to "visible" the iframe keeps playing in a background
-    // tab and timers are not throttled, so the ENDED event fires normally. The
-    // watchdog stays as a belt-and-braces backstop in case a browser still defers
-    // the event; it advances the queue if a video reaches its end regardless.
-    watchdogTimer = setInterval(() => {
-        if (advancing || !ytPlayer) return;
-        if (typeof ytPlayer.getCurrentTime !== 'function') return;
-        if (typeof ytPlayer.getDuration   !== 'function') return;
-        const state = typeof ytPlayer.getPlayerState === 'function'
-            ? ytPlayer.getPlayerState() : -1;
-        if (state === YT.PlayerState.ENDED) { advance(); return; }
-        const dur = ytPlayer.getDuration();
-        const cur = ytPlayer.getCurrentTime();
-        // Within 0.6s of the end and effectively stopped progressing → treat as done.
-        if (dur > 0 && cur > 0 && dur - cur <= 0.6) advance();
-    }, 1000);
-}
-
-function stopWatchdog() {
-    if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
-}
-
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
 const idleScreen    = document.getElementById('idle-screen');
 const ytContainer   = document.getElementById('yt-player');
 const spotifyFrame  = document.getElementById('spotify-player');
+
+// Hidden same-origin audio element — the playback authority in audio mode.
+// Created once and reused. It is never removed, so the browser keeps it alive in
+// the background.
+const audioEl = new Audio();
+audioEl.preload  = 'auto';
+audioEl.autoplay = true;
+audioEl.volume   = 1;
 
 // ── Controls (visible when ?controls=1) ───────────────────────────────────────
 
@@ -140,10 +116,21 @@ function formatTime(sec) {
     return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+// In audio mode the seek/volume/time all read from the <audio> element.
 function startPoll() {
     if (!CONTROLS || pollTimer) return;
     pollTimer = setInterval(() => {
-        if (isSeeking || !ytPlayer || typeof ytPlayer.getCurrentTime !== 'function') return;
+        if (isSeeking) return;
+        if (YT_AUDIO_MODE) {
+            const dur = audioEl.duration;
+            const cur = audioEl.currentTime;
+            if (dur > 0 && isFinite(dur)) {
+                seekBar.value = (cur / dur) * 100;
+                timeDisplay.textContent = `${formatTime(cur)} / ${formatTime(dur)}`;
+            }
+            return;
+        }
+        if (!ytPlayer || typeof ytPlayer.getCurrentTime !== 'function') return;
         const state = typeof ytPlayer.getPlayerState === 'function' ? ytPlayer.getPlayerState() : -1;
         if (state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.PAUSED) return;
         const dur = ytPlayer.getDuration();
@@ -166,14 +153,25 @@ if (CONTROLS) {
     seekBar.addEventListener('mousedown',  () => { isSeeking = true; });
     seekBar.addEventListener('touchstart', () => { isSeeking = true; }, { passive: true });
     seekBar.addEventListener('input', () => {
-        if (!ytPlayer || typeof ytPlayer.getDuration !== 'function') return;
-        const dur = ytPlayer.getDuration();
-        if (!dur || isNaN(dur)) return;
+        let dur;
+        if (YT_AUDIO_MODE) dur = audioEl.duration;
+        else if (ytPlayer && typeof ytPlayer.getDuration === 'function') dur = ytPlayer.getDuration();
+        if (!dur || isNaN(dur) || !isFinite(dur)) return;
         const sec = (seekBar.value / 100) * dur;
         timeDisplay.textContent = `${formatTime(sec)} / ${formatTime(dur)}`;
     });
     seekBar.addEventListener('change', () => {
         isSeeking = false;
+        if (YT_AUDIO_MODE) {
+            const dur = audioEl.duration;
+            if (!dur || isNaN(dur) || !isFinite(dur)) return;
+            audioEl.currentTime = (seekBar.value / 100) * dur;
+            // Keep the muted video picture roughly in sync if it's present.
+            if (ytPlayer && typeof ytPlayer.seekTo === 'function') {
+                try { ytPlayer.seekTo(audioEl.currentTime, true); } catch {}
+            }
+            return;
+        }
         if (!ytPlayer || typeof ytPlayer.seekTo !== 'function') return;
         const dur = ytPlayer.getDuration();
         if (!dur || isNaN(dur)) return;
@@ -183,11 +181,27 @@ if (CONTROLS) {
     // Volume
     volumeBar.addEventListener('input', () => {
         const vol = Number(volumeBar.value);
+        if (YT_AUDIO_MODE) {
+            audioEl.muted  = vol === 0;
+            audioEl.volume = Math.max(0, Math.min(1, vol / 100));
+            return;
+        }
         if (!ytPlayer || typeof ytPlayer.setVolume !== 'function') return;
         if (vol === 0) { ytPlayer.mute(); }
         else { ytPlayer.unMute(); ytPlayer.setVolume(vol); }
     });
 }
+
+// ── Audio element events (audio-mode playback authority) ───────────────────────
+
+audioEl.addEventListener('ended', () => { advance(); });
+audioEl.addEventListener('error', () => {
+    if (!audioEl.src) return;            // ignore the empty-src reset
+    console.error('Audio element error, advancing.');
+    advance();
+});
+audioEl.addEventListener('playing', () => { if (CONTROLS) startPoll(); });
+audioEl.addEventListener('pause',   () => { /* keep poll; user may resume via seek */ });
 
 function clearYouTubeFallbackTimer() {
     if (ytFallbackTimer) {
@@ -221,12 +235,18 @@ function fallbackEmbed(videoId) {
             ytPlayer = new YT.Player('yt-fallback-iframe', {
                 events: {
                     onReady(event) {
-                        event.target.unMute();
-                        if (CONTROLS && volumeBar) event.target.setVolume(Number(volumeBar.value));
-                        startPoll();
-                        startWatchdog();
+                        if (YT_AUDIO_MODE) {
+                            // Video picture only — never let the iframe make sound.
+                            event.target.mute();
+                        } else {
+                            event.target.unMute();
+                            if (CONTROLS && volumeBar) event.target.setVolume(Number(volumeBar.value));
+                            startPoll();
+                            startWatchdog();
+                        }
                     },
                     onStateChange(event) {
+                        if (YT_AUDIO_MODE) return;   // audio element drives advance()
                         if (event.data === YT.PlayerState.ENDED) advance();
                         if (CONTROLS) {
                             if (event.data === YT.PlayerState.PLAYING) startPoll();
@@ -254,6 +274,29 @@ function scheduleFallback(videoId) {
         if (ytApiReady) return;
         fallbackEmbed(videoId);
     }, 2500);
+}
+
+// ── Watchdog (iframe mode only) ────────────────────────────────────────────────
+// In audio mode the <audio> 'ended' event is reliable in the background, so the
+// watchdog is not used. It remains for the legacy iframe-audio mode.
+function startWatchdog() {
+    if (YT_AUDIO_MODE) return;
+    if (watchdogTimer) return;
+    watchdogTimer = setInterval(() => {
+        if (advancing || !ytPlayer) return;
+        if (typeof ytPlayer.getCurrentTime !== 'function') return;
+        if (typeof ytPlayer.getDuration   !== 'function') return;
+        const state = typeof ytPlayer.getPlayerState === 'function'
+            ? ytPlayer.getPlayerState() : -1;
+        if (state === YT.PlayerState.ENDED) { advance(); return; }
+        const dur = ytPlayer.getDuration();
+        const cur = ytPlayer.getCurrentTime();
+        if (dur > 0 && cur > 0 && dur - cur <= 0.6) advance();
+    }, 1000);
+}
+
+function stopWatchdog() {
+    if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
 }
 
 // ── Advance queue (called when a track finishes) ───────────────────────────────
@@ -291,6 +334,15 @@ function destroyYouTubePlayer() {
     ytContainer.innerHTML = '';
 }
 
+// Stop and clear the audio element (without removing it from the DOM/memory).
+function stopAudio() {
+    try {
+        audioEl.pause();
+        audioEl.removeAttribute('src');
+        audioEl.load();   // abort any in-flight network fetch
+    } catch {}
+}
+
 function showIdle() {
     idleScreen.style.display   = 'flex';
     ytContainer.style.display  = 'none';
@@ -298,6 +350,7 @@ function showIdle() {
     spotifyFrame.src = '';
     clearYouTubeFallbackTimer();
     destroyYouTubePlayer();          // clear completely — no lingering replayable video
+    stopAudio();
     currentItemId = null;
     stopPoll();
     stopWatchdog();
@@ -305,10 +358,78 @@ function showIdle() {
     if (CONTROLS && timeDisplay) timeDisplay.textContent = '0:00 / 0:00';
 }
 
-function playYouTube(videoId) {
+// Audio-mode YouTube playback: native <audio> drives sound + timing; the muted
+// iframe (if the API is ready) just shows the picture.
+function playYouTubeAudioMode(videoId) {
     idleScreen.style.display   = 'none';
     spotifyFrame.style.display = 'none';
     ytContainer.style.display  = 'block';
+
+    if (CONTROLS && seekBar)     { seekBar.value = 0; seekBar.disabled = false; }
+    if (CONTROLS && timeDisplay) timeDisplay.textContent = '0:00 / 0:00';
+
+    // 1) Start the audio (the part that must survive a background tab).
+    audioEl.src = `/api/yt-audio/${encodeURIComponent(videoId)}`;
+    if (CONTROLS && volumeBar) {
+        const vol = Number(volumeBar.value);
+        audioEl.muted  = vol === 0;
+        audioEl.volume = Math.max(0, Math.min(1, vol / 100));
+    } else {
+        audioEl.muted  = false;
+        audioEl.volume = 1;
+    }
+    const p = audioEl.play();
+    if (p && p.catch) {
+        p.catch(err => {
+            // Autoplay may be blocked until a user gesture (first load in a fresh
+            // window). The pointerdown handler below retries; log for visibility.
+            console.warn('Audio autoplay blocked — click once to start.', err?.message || err);
+        });
+    }
+    if (CONTROLS) startPoll();
+
+    // 2) Show the muted video picture via the iframe, best-effort.
+    if (!ytApiReady) {
+        pendingVideoId = videoId;
+        scheduleFallback(videoId);
+        return;
+    }
+    clearYouTubeFallbackTimer();
+    ytContainer.innerHTML = '';
+    if (!ytPlayer) {
+        ytPlayer = new YT.Player('yt-player', {
+            width:  '100%',
+            height: '100%',
+            videoId,
+            playerVars: {
+                autoplay: 1, playsinline: 1, controls: 0, rel: 0,
+                modestbranding: 1, enablejsapi: 1, mute: 1,
+                origin: window.location.origin
+            },
+            events: {
+                onReady(event) {
+                    event.target.mute();          // picture only — no second audio
+                    event.target.playVideo();
+                },
+                onStateChange() { /* audio element drives advance() */ },
+                onError() { /* picture failing is non-fatal in audio mode */ }
+            }
+        });
+    } else {
+        ytPlayer.loadVideoById(videoId);
+        ytPlayer.mute();
+        ytPlayer.playVideo();
+    }
+}
+
+function playYouTube(videoId) {
+    if (YT_AUDIO_MODE) { playYouTubeAudioMode(videoId); return; }
+
+    // ── Legacy iframe-audio mode (&ytmode=iframe) ──
+    idleScreen.style.display   = 'none';
+    spotifyFrame.style.display = 'none';
+    ytContainer.style.display  = 'block';
+    stopAudio();
     stopPoll();
     if (CONTROLS && seekBar)     { seekBar.value = 0; seekBar.disabled = false; }
     if (CONTROLS && timeDisplay) timeDisplay.textContent = '0:00 / 0:00';
@@ -378,6 +499,7 @@ function playSpotify(info) {
     ytContainer.style.display  = 'none';
     spotifyFrame.style.display = 'block';
     clearYouTubeFallbackTimer();
+    stopAudio();
     stopPoll();
     if (CONTROLS && seekBar)     { seekBar.value = 0; seekBar.disabled = true; }
     if (CONTROLS && timeDisplay) timeDisplay.textContent = 'Spotify';
@@ -424,6 +546,16 @@ window.onYouTubeIframeAPIReady = function () {
     }
 };
 
+// First user gesture: retry audio playback in case autoplay was blocked on a
+// fresh window load. Cheap and safe — play() on an already-playing element is a
+// no-op.
+['click', 'keydown', 'touchstart', 'pointerdown'].forEach(ev =>
+    window.addEventListener(ev, () => {
+        if (YT_AUDIO_MODE && audioEl.src && audioEl.paused) {
+            audioEl.play().catch(() => {});
+        }
+    }, { passive: true }));
+
 // ── Socket.io + initial load ──────────────────────────────────────────────────
 
 async function fetchAndPlay() {
@@ -456,8 +588,7 @@ if (CHANNEL) {
     // Safety re-sync: if a queue:update socket message is ever missed (e.g. while
     // the tab was hidden and the socket briefly slept), this low-frequency poll
     // re-checks the current item so the overlay self-heals. playItem() is a no-op
-    // when the current item is already playing, so this is cheap. Throttled to
-    // ~once/minute when hidden, which is fine as a backstop.
+    // when the current item is already playing, so this is cheap.
     setInterval(() => {
         if (!advancing) fetchAndPlay();
     }, 10000);

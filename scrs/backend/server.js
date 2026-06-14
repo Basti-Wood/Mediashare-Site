@@ -6,6 +6,7 @@ const session  = require('express-session');
 const http     = require('http');
 const path     = require('path');
 const fs       = require('fs');
+const { execFile } = require('child_process');
 const WebSocket = require('ws');
 const { Server } = require('socket.io');
 
@@ -690,6 +691,75 @@ async function promoteMyListHeadToBasti(ch) {
         ownerPushInFlight.delete(ch);
     }
 }
+
+// ── YouTube direct-audio resolver (yt-dlp) ────────────────────────────────────
+//
+// Why this exists: the YouTube IFrame player runs in a cross-origin iframe that
+// the browser (Brave/Chrome) suspends when this page is a background tab — that's
+// what kept stopping playback. We can't capture or control the iframe's audio
+// from JS. Instead we resolve a DIRECT audio stream URL with yt-dlp and let the
+// overlay play it through a normal same-origin <audio> element, which the browser
+// does NOT suspend in the background.
+//
+// The endpoint 302-redirects to the resolved googlevideo URL (cheap — we don't
+// proxy the audio bytes). Those URLs are signed and time-limited (a few hours),
+// so we cache them briefly to avoid spawning yt-dlp on every play.
+
+const ytAudioCache = new Map(); // videoId -> { url, expires }
+const YT_AUDIO_TTL_MS = 90 * 60 * 1000; // 90 min — comfortably inside the signed-URL lifetime
+
+function resolveYouTubeAudioUrl(videoId) {
+    return new Promise((resolve, reject) => {
+        // -f bestaudio: pick the best audio-only stream.
+        // -g: print the direct media URL instead of downloading.
+        // --no-playlist: a bare ID must never expand into a list.
+        execFile(
+            'yt-dlp',
+            [
+                '-f', 'bestaudio',
+                '-g',
+                '--no-playlist',
+                '--no-warnings',
+                `https://www.youtube.com/watch?v=${videoId}`
+            ],
+            { timeout: 20000, maxBuffer: 1024 * 1024 },
+            (err, stdout, stderr) => {
+                if (err) {
+                    return reject(new Error(String(stderr || err.message).trim()));
+                }
+                const url = String(stdout).trim().split('\n')[0];
+                if (!url || !/^https?:\/\//.test(url)) {
+                    return reject(new Error('yt-dlp returned no usable URL'));
+                }
+                resolve(url);
+            }
+        );
+    });
+}
+
+// GET a direct audio stream for a YouTube video id. Redirects to the resolved
+// googlevideo URL. No auth: the overlay (OBS browser source / background tab)
+// has no session, same as the other /api/channels endpoints.
+app.get('/api/yt-audio/:videoId', async (req, res) => {
+    const videoId = String(req.params.videoId || '');
+    if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
+        return res.status(400).json({ error: 'Invalid video id.' });
+    }
+
+    const cached = ytAudioCache.get(videoId);
+    if (cached && cached.expires > Date.now()) {
+        return res.redirect(302, cached.url);
+    }
+
+    try {
+        const url = await resolveYouTubeAudioUrl(videoId);
+        ytAudioCache.set(videoId, { url, expires: Date.now() + YT_AUDIO_TTL_MS });
+        return res.redirect(302, url);
+    } catch (e) {
+        console.error(`yt-dlp failed for ${videoId}:`, e.message || e);
+        return res.status(502).json({ error: 'Could not resolve audio stream.' });
+    }
+});
 
 // ── Overlay endpoints (no auth — used by OBS browser source) ─────────────────
 
