@@ -20,6 +20,9 @@ const logoutBtn       = document.getElementById('logout-btn');
 const tabList         = document.getElementById('channel-tab-list');
 const previewFrame    = document.getElementById('preview-frame');
 const overlayUrl      = document.getElementById('overlay-url');
+const overlayUrlInput = document.getElementById('overlay-url-input');
+const copyObsUrlBtn   = document.getElementById('copy-obs-url-btn');
+const popoutBtn       = document.getElementById('popout-btn');
 const nowPlaying      = document.getElementById('now-playing-info');
 const skipCurrentBtn  = document.getElementById('skip-current-btn');
 const queueCount      = document.getElementById('queue-count');
@@ -335,6 +338,10 @@ if (skipCurrentBtn) skipCurrentBtn.addEventListener('click', skipCurrent);
 
 // ── Channel switching ─────────────────────────────────────────────────────────
 
+// The full standalone overlay URL for the current channel (no &controls), used
+// by the OBS copy button and the pop-out window. Kept in sync by switchChannel.
+let currentOverlayUrl = '';
+
 function switchChannel(channel) {
     if (channel === currentChannel) return;
     if (socket && currentChannel) socket.emit('leave:channel', currentChannel);
@@ -347,12 +354,49 @@ function switchChannel(channel) {
     const overlayPath    = `/HTML/overlay.html?channel=${encodeURIComponent(channel)}`;
     const previewPath    = `${overlayPath}&controls=1`;
     previewFrame.src     = previewPath;
-    if (overlayUrl) overlayUrl.textContent = `${window.location.origin}${overlayPath}`;
+    currentOverlayUrl    = `${window.location.origin}${overlayPath}`;
+    if (overlayUrl)      overlayUrl.textContent = currentOverlayUrl;
+    if (overlayUrlInput) overlayUrlInput.value  = currentOverlayUrl;
 
     if (socket) socket.emit('join:channel', channel);
     loadMedia();
     loadMode();
     if (activeQueueTab === 'mylist') loadMyList();
+}
+
+// Copy the OBS browser-source URL to the clipboard.
+if (copyObsUrlBtn) {
+    copyObsUrlBtn.addEventListener('click', async () => {
+        if (!currentOverlayUrl) return;
+        try {
+            await navigator.clipboard.writeText(currentOverlayUrl);
+        } catch {
+            // Clipboard API can be blocked on non-HTTPS / no focus — fall back
+            // to selecting the field so the user can copy manually.
+            if (overlayUrlInput) { overlayUrlInput.focus(); overlayUrlInput.select(); }
+        }
+        const original = copyObsUrlBtn.textContent;
+        copyObsUrlBtn.textContent = 'Copied!';
+        copyObsUrlBtn.classList.add('is-success');
+        setTimeout(() => {
+            copyObsUrlBtn.textContent = original;
+            copyObsUrlBtn.classList.remove('is-success');
+        }, 1500);
+    });
+}
+
+// Open the player in its own browser window. A separate OS-level window keeps
+// running when the MAIN browser window is minimised (unlike a background tab),
+// so this is the best background-playback option outside of OBS.
+if (popoutBtn) {
+    popoutBtn.addEventListener('click', () => {
+        if (!currentOverlayUrl) return;
+        window.open(
+            `${currentOverlayUrl}&controls=1`,
+            'mediashare_player',
+            'width=860,height=520,menubar=no,toolbar=no,location=no,status=no'
+        );
+    });
 }
 
 function buildTabs(channels) {
