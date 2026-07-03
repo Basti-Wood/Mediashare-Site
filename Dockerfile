@@ -10,7 +10,7 @@ RUN apk add --no-cache python3 ffmpeg ca-certificates wget \
     && chmod a+rx /usr/local/bin/yt-dlp
 
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 COPY . .
 
