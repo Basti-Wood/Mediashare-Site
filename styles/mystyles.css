@@ -140,10 +140,11 @@
     flex-shrink: 0;
 }
 
-/* The two panels share the leftover space and scroll internally instead of
+/* The panels share the leftover space and scroll internally instead of
    pushing the tab bar off-screen. */
 #panel-requests,
-#panel-mylist {
+#panel-mylist,
+#panel-local {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
@@ -848,4 +849,75 @@ body.config-page {
 	border-radius: 8px;
 	color: #fff;
 	font-size: 14px;
+}
+
+/* ── Local Files panel ─────────────────────────────────────── */
+#panel-local {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+#local-folder-input {
+    background: #1a1a1a;
+    border-color: #333;
+    color: #e0e0e0;
+}
+#local-folder-input::placeholder { color: #555; }
+#local-folder-input:focus {
+    border-color: #0f3460;
+    box-shadow: 0 0 0 0.125em rgba(15, 52, 96, 0.35);
+}
+
+#local-folder-select-wrap {
+    max-width: 100%;
+}
+#local-folder-select-wrap .select,
+#local-folder-select-wrap select {
+    width: 100%;
+}
+#local-folder-select {
+    background: #1a1a1a;
+    border-color: #333;
+    color: #e0e0e0;
+    font-size: 0.78rem;
+}
+
+#local-file-input {
+    position: absolute;
+    width: 0.1px;
+    height: 0.1px;
+    opacity: 0;
+    overflow: hidden;
+}
+
+#local-upload-label {
+    cursor: pointer;
+}
+
+#local-folder-status,
+#local-upload-status {
+    min-height: 1.2em;
+}
+
+.local-folder-tag {
+    cursor: default;
+    user-select: none;
+}
+.local-folder-tag .delete {
+    vertical-align: middle;
+}
+
+#local-file-table.table {
+    background: transparent;
+    color: #e0e0e0;
+}
+#local-file-table.table th {
+    color: #aaa;
+    border-color: #333;
+}
+#local-file-table.table td {
+    border-color: #2a2a2a;
+    vertical-align: middle;
 }

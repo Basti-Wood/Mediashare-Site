@@ -7,6 +7,7 @@ const http     = require('http');
 const path     = require('path');
 const fs       = require('fs');
 const { execFile } = require('child_process');
+const multer   = require('multer');
 const WebSocket = require('ws');
 const { Server } = require('socket.io');
 
@@ -850,6 +851,260 @@ app.post('/api/webhook/:ch', (req, res) => {
     io.to(`ch:${req.params.ch}`).emit('queue:update', { channel: req.params.ch });
     res.status(200).json({ success: true });
 });
+
+// ── Local media (MP3 upload, folder management, instant playback) ─────────────
+
+const LOCAL_MEDIA_ROOT = path.join(__dirname, '../..', 'data', 'local-media');
+
+function localMediaDir(channel, folder = '') {
+    const dir = path.join(LOCAL_MEDIA_ROOT, sanitisePath(channel), sanitisePath(folder));
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+}
+
+function sanitisePath(segment) {
+    // Strip anything that isn't a safe filename character; collapse dots & slashes.
+    return String(segment || '')
+        .replace(/\.\./g, '')
+        .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+        .replace(/^\.+/, '')
+        .trim() || '_';
+}
+
+// Multer storage: keep original filename (sanitised), organised by channel/folder.
+const localUpload = multer({
+    storage: multer.diskStorage({
+        destination(req, file, cb) {
+            const channel = sanitisePath(req.params.channel || '');
+            const folder  = sanitisePath(req.params.folder || '');
+            cb(null, localMediaDir(channel, folder));
+        },
+        filename(req, file, cb) {
+            const ext  = path.extname(file.originalname) || '.mp3';
+            const base = sanitisePath(path.basename(file.originalname, ext));
+            cb(null, `${base}${ext}`);
+        }
+    }),
+    fileFilter(req, file, cb) {
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (ext !== '.mp3' && file.mimetype !== 'audio/mpeg') {
+            return cb(new Error('Only MP3 files are allowed.'));
+        }
+        cb(null, true);
+    },
+    limits: { fileSize: 50 * 1024 * 1024 }  // 50 MB per file
+});
+
+// List folders for a channel
+app.get('/api/local/:channel/folders', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    try {
+        const base = localMediaDir(req.params.channel);
+        const entries = fs.readdirSync(base, { withFileTypes: true });
+        const folders = entries.filter(e => e.isDirectory()).map(e => e.name).sort();
+        res.json({ folders });
+    } catch (e) {
+        res.status(500).json({ error: 'Could not list folders.' });
+    }
+});
+
+// Create a folder
+app.post('/api/local/:channel/folders', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    const name = sanitisePath(String(req.body?.name || '').trim());
+    if (!name) return res.status(400).json({ error: 'Folder name required.' });
+    try {
+        localMediaDir(req.params.channel, name);
+        res.json({ success: true, folder: name });
+    } catch (e) {
+        res.status(500).json({ error: 'Could not create folder.' });
+    }
+});
+
+// Delete a folder (and all files inside)
+app.delete('/api/local/:channel/folders/:folder', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    try {
+        const dir = localMediaDir(req.params.channel, req.params.folder);
+        fs.rmSync(dir, { recursive: true, force: true });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Could not delete folder.' });
+    }
+});
+
+// List files (optionally scoped to a folder)
+app.get('/api/local/:channel/files', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    listLocalFiles(req.params.channel, '').then(files => res.json({ files }))
+        .catch(() => res.status(500).json({ error: 'Could not list files.' }));
+});
+
+app.get('/api/local/:channel/files/:folder', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    listLocalFiles(req.params.channel, req.params.folder).then(files => res.json({ files }))
+        .catch(() => res.status(500).json({ error: 'Could not list files.' }));
+});
+
+async function listLocalFiles(channel, folder) {
+    const base  = localMediaDir(channel, folder);
+    const files = [];
+    // Walk the folder (non-recursive for the specified folder; when folder=''
+    // we walk the base dir AND one level of subdirectories).
+    if (!folder) {
+        // Show files in root AND in each subfolder
+        const entries = fs.readdirSync(base, { withFileTypes: true });
+        for (const e of entries) {
+            if (e.isDirectory()) {
+                const subDir = path.join(base, e.name);
+                const subs = fs.readdirSync(subDir, { withFileTypes: true });
+                for (const s of subs) {
+                    if (s.isFile() && s.name.toLowerCase().endsWith('.mp3')) {
+                        files.push({ name: s.name, folder: e.name, path: `${e.name}/${s.name}` });
+                    }
+                }
+            } else if (e.isFile() && e.name.toLowerCase().endsWith('.mp3')) {
+                files.push({ name: e.name, folder: '', path: e.name });
+            }
+        }
+    } else {
+        const entries = fs.readdirSync(base, { withFileTypes: true });
+        for (const e of entries) {
+            if (e.isFile() && e.name.toLowerCase().endsWith('.mp3')) {
+                files.push({ name: e.name, folder, path: `${folder}/${e.name}` });
+            }
+        }
+    }
+    return files.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Upload MP3 files (optionally into a folder).  The :folder param is optional;
+// express doesn't support optional params natively, so we register two routes.
+app.post('/api/local/:channel/upload', requireAuth, (req, res, next) => {
+    req.params.folder = '';
+    next();
+});
+app.post('/api/local/:channel/upload/:folder', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    localUpload.array('files', 20)(req, res, err => {
+        if (err) {
+            const msg = String(err.message || err);
+            if (msg.includes('Only MP3')) return res.status(400).json({ error: msg });
+            return res.status(500).json({ error: msg });
+        }
+        const uploaded = (req.files || []).length;
+        io.to(`ch:${req.params.channel}`).emit('queue:update', { channel: req.params.channel });
+        res.json({ success: true, uploaded });
+    });
+});
+
+// Delete a single file
+app.delete('/api/local/:channel/files/:folder/:filename', requireAuth, (req, res) => {
+    deleteLocalFileEndpoint(req, res);
+});
+app.delete('/api/local/:channel/files/:filename', requireAuth, (req, res) => {
+    deleteLocalFileEndpoint(req, res);
+});
+
+function deleteLocalFileEndpoint(req, res) {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    try {
+        const folder   = sanitisePath(req.params.folder || '');
+        const filename = sanitisePath(req.params.filename || '');
+        const dir      = localMediaDir(req.params.channel, folder);
+        const filePath = path.join(dir, filename);
+        if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found.' });
+        // Safety: ensure the resolved path is still inside our media tree.
+        if (!filePath.startsWith(localMediaDir(req.params.channel))) {
+            return res.status(400).json({ error: 'Invalid path.' });
+        }
+        fs.unlinkSync(filePath);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Could not delete file.' });
+    }
+}
+
+// Serve a local MP3 file for playback (no auth — used by the overlay/OBS).
+app.get('/api/local-media/:channel/:folder/:filename', (req, res) => {
+    serveLocalFile(req, res);
+});
+app.get('/api/local-media/:channel/:filename', (req, res) => {
+    serveLocalFile(req, res);
+});
+
+function serveLocalFile(req, res) {
+    try {
+        const folder   = sanitisePath(req.params.folder || '');
+        const filename = sanitisePath(req.params.filename || '');
+        const dir      = localMediaDir(req.params.channel, folder);
+        const filePath = path.join(dir, filename);
+        if (!filePath.startsWith(localMediaDir(req.params.channel))) {
+            return res.status(400).json({ error: 'Invalid path.' });
+        }
+        if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found.' });
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.sendFile(filePath);
+    } catch (e) {
+        res.status(500).json({ error: 'Could not serve file.' });
+    }
+}
+
+// Push a local MP3 to play NOW — inserts it at the front of the Basti queue
+// as an owner song and removes whatever was already playing so it starts instantly.
+app.post('/api/local/:channel/play/:folder/:filename', requireAuth, async (req, res) => {
+    playLocalFileNow(req, res);
+});
+app.post('/api/local/:channel/play/:filename', requireAuth, async (req, res) => {
+    playLocalFileNow(req, res);
+});
+
+async function playLocalFileNow(req, res) {
+    const ch = req.params.channel;
+    if (!hasAccess(req.session.user, ch))
+        return res.status(403).json({ error: 'Access denied.' });
+
+    try {
+        const folder   = sanitisePath(req.params.folder || '');
+        const filename = sanitisePath(req.params.filename || '');
+        const dir      = localMediaDir(ch, folder);
+        const filePath = path.join(dir, filename);
+
+        if (!filePath.startsWith(localMediaDir(ch)))
+            return res.status(400).json({ error: 'Invalid path.' });
+        if (!fs.existsSync(filePath))
+            return res.status(404).json({ error: 'File not found.' });
+
+        // Build a URL the overlay can fetch (localhost from the server's perspective,
+        // but the overlay runs in the browser — use a relative URL).
+        const mediaUrl = folder
+            ? `/api/local-media/${encodeURIComponent(ch)}/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`
+            : `/api/local-media/${encodeURIComponent(ch)}/${encodeURIComponent(filename)}`;
+
+        const user = ownerUsernameFor(ch);
+        const entry = { url: mediaUrl, title: filename, platform: 'local' };
+
+        // Remove the currently-playing item first so the new one plays immediately.
+        try { await bastiPost(`/removemedia/${encodeURIComponent(ch)}/0`); } catch {}
+
+        // Push the local song to the front of Basti.
+        await pushOwnerSongToBasti(ch, entry);
+
+        io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
+        res.json({ success: true, url: mediaUrl });
+    } catch (e) {
+        console.error('playLocalFileNow failed:', e.message || e);
+        res.status(500).json({ error: 'Could not play file.' });
+    }
+}
 
 // ── Socket.io ─────────────────────────────────────────────────────────────────
 

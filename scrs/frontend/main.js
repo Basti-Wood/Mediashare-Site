@@ -45,6 +45,22 @@ const mylistTbody     = document.getElementById('mylist-tbody');
 // Mode selector
 const modeSelect      = document.getElementById('mode-select');
 
+// Local Files DOM refs
+const panelLocal          = document.getElementById('panel-local');
+const localFolderInput    = document.getElementById('local-folder-input');
+const localFolderCreateBtn = document.getElementById('local-folder-create-btn');
+const localFolderStatus   = document.getElementById('local-folder-status');
+const localFolderSelect   = document.getElementById('local-folder-select');
+const localFileInput      = document.getElementById('local-file-input');
+const localUploadLabel    = document.getElementById('local-upload-label');
+const localUploadStatus   = document.getElementById('local-upload-status');
+const localFolderList     = document.getElementById('local-folder-list');
+const localFileCount      = document.getElementById('local-file-count');
+const localFileEmpty      = document.getElementById('local-file-empty');
+const localFileTable      = document.getElementById('local-file-table');
+const localFileTbody      = document.getElementById('local-file-tbody');
+let   localCurrentFolder  = '';   // '' = all files
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function esc(str) {
@@ -228,7 +244,9 @@ function setupQueueTypeTabs() {
                 t.classList.toggle('is-active', t === li));
             panelRequests.style.display = activeQueueTab === 'requests' ? '' : 'none';
             panelMylist.style.display   = activeQueueTab === 'mylist'   ? '' : 'none';
+            panelLocal.style.display    = activeQueueTab === 'local'    ? '' : 'none';
             if (activeQueueTab === 'mylist') loadMyList();
+            if (activeQueueTab === 'local')  { loadLocalFolders(); loadLocalFiles(); }
         });
     });
 
@@ -236,6 +254,209 @@ function setupQueueTypeTabs() {
     mylistUrlInput.addEventListener('keydown', e => {
         if (e.key === 'Enter') addToMyList(mylistUrlInput.value);
     });
+
+    // Local-files event wiring
+    localFolderCreateBtn.addEventListener('click', createLocalFolder);
+    localFolderInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') createLocalFolder();
+    });
+    localFileInput.addEventListener('change', uploadLocalFiles);
+    localFolderSelect.addEventListener('change', () => {
+        localCurrentFolder = localFolderSelect.value;
+        loadLocalFiles();
+    });
+}
+
+// ── Local Files API ───────────────────────────────────────────────────────────
+
+async function loadLocalFolders() {
+    if (!currentChannel) return;
+    try {
+        const res  = await fetch(`/api/local/${encodeURIComponent(currentChannel)}/folders`);
+        if (!res.ok) throw new Error(res.status);
+        const data = await res.json();
+        const folders = Array.isArray(data.folders) ? data.folders : [];
+        // Rebuild folder select dropdown
+        localFolderSelect.innerHTML = '<option value="">(all folders)</option>' +
+            folders.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join('');
+        if (localCurrentFolder && !folders.includes(localCurrentFolder)) {
+            localCurrentFolder = '';
+            localFolderSelect.value = '';
+        } else if (localCurrentFolder) {
+            localFolderSelect.value = localCurrentFolder;
+        }
+        // Render folder list with delete buttons
+        localFolderList.innerHTML = folders.length === 0
+            ? '<p class="has-text-grey is-size-7">No folders yet.</p>'
+            : folders.map(f => `
+                <span class="local-folder-tag tag is-dark mr-1 mb-1">
+                    ${esc(f)}
+                    <button class="delete is-small ml-1" data-lf-delete-folder="${esc(f)}"
+                            title="Delete folder"></button>
+                </span>`).join('');
+        localFolderList.querySelectorAll('button[data-lf-delete-folder]').forEach(btn => {
+            btn.addEventListener('click', () => deleteLocalFolder(btn.dataset.lfDeleteFolder));
+        });
+    } catch (e) {
+        console.error('Failed to load local folders', e);
+    }
+}
+
+async function createLocalFolder() {
+    const name = localFolderInput.value.trim();
+    if (!name) return;
+    localFolderCreateBtn.disabled = true;
+    localFolderStatus.className = 'is-size-7 mb-3 has-text-grey';
+    localFolderStatus.textContent = 'Creating…';
+    try {
+        const res = await fetch(`/api/local/${encodeURIComponent(currentChannel)}/folders`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            localFolderStatus.className = 'is-size-7 mb-3 has-text-danger';
+            localFolderStatus.textContent = data.error || 'Failed to create folder.';
+        } else {
+            localFolderStatus.className = 'is-size-7 mb-3 has-text-success';
+            localFolderStatus.textContent = `Folder "${esc(name)}" created.`;
+            localFolderInput.value = '';
+            await loadLocalFolders();
+        }
+    } catch {
+        localFolderStatus.className = 'is-size-7 mb-3 has-text-danger';
+        localFolderStatus.textContent = 'Network error.';
+    } finally {
+        localFolderCreateBtn.disabled = false;
+    }
+}
+
+async function deleteLocalFolder(name) {
+    if (!confirm(`Delete folder "${name}" and all files inside?`)) return;
+    try {
+        await fetch(`/api/local/${encodeURIComponent(currentChannel)}/folders/${encodeURIComponent(name)}`,
+                    { method: 'DELETE' });
+        if (localCurrentFolder === name) {
+            localCurrentFolder = '';
+            localFolderSelect.value = '';
+        }
+        await loadLocalFolders();
+        await loadLocalFiles();
+    } catch (e) {
+        console.error('Failed to delete folder', e);
+    }
+}
+
+async function loadLocalFiles() {
+    if (!currentChannel) return;
+    try {
+        const folder = localCurrentFolder ? `/${encodeURIComponent(localCurrentFolder)}` : '';
+        const res = await fetch(`/api/local/${encodeURIComponent(currentChannel)}/files${folder}`);
+        if (!res.ok) throw new Error(res.status);
+        const data = await res.json();
+        const files = Array.isArray(data.files) ? data.files : [];
+        localFileCount.textContent = files.length;
+        if (files.length === 0) {
+            localFileEmpty.style.display = '';
+            localFileTable.style.display = 'none';
+            return;
+        }
+        localFileEmpty.style.display = 'none';
+        localFileTable.style.display = '';
+        localFileTbody.innerHTML = files.map((f, i) => `
+            <tr>
+                <td>${i + 1}</td>
+                <td class="queue-title">${esc(f.name)}</td>
+                <td>${esc(f.folder || '—')}</td>
+                <td>
+                    <div class="buttons are-small">
+                        <button class="button is-success is-small"
+                                data-lf-play="${esc(f.folder || '')}||${esc(f.name)}"
+                                title="Play now">▶ Play</button>
+                        <button class="button is-danger is-small"
+                                data-lf-delete="${esc(f.folder || '')}||${esc(f.name)}"
+                                title="Delete">✕</button>
+                    </div>
+                </td>
+            </tr>
+        `).join('');
+        localFileTbody.querySelectorAll('button[data-lf-play]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const [folder, name] = btn.dataset.lfPlay.split('||');
+                playLocalNow(folder, name);
+            });
+        });
+        localFileTbody.querySelectorAll('button[data-lf-delete]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const [folder, name] = btn.dataset.lfDelete.split('||');
+                deleteLocalFile(folder, name);
+            });
+        });
+    } catch (e) {
+        console.error('Failed to load local files', e);
+    }
+}
+
+async function uploadLocalFiles() {
+    const files = localFileInput.files;
+    if (!files || files.length === 0) return;
+    localUploadLabel.classList.add('is-loading');
+    localUploadStatus.className = 'is-size-7 mb-3 has-text-grey';
+    localUploadStatus.textContent = `Uploading ${files.length} file(s)…`;
+    try {
+        const folder = localCurrentFolder;
+        const formData = new FormData();
+        for (const f of files) formData.append('files', f);
+        const res = await fetch(
+            `/api/local/${encodeURIComponent(currentChannel)}/upload${folder ? '/' + encodeURIComponent(folder) : ''}`,
+            { method: 'POST', body: formData });
+        const data = await res.json();
+        if (!res.ok) {
+            localUploadStatus.className = 'is-size-7 mb-3 has-text-danger';
+            localUploadStatus.textContent = data.error || 'Upload failed.';
+        } else {
+            localUploadStatus.className = 'is-size-7 mb-3 has-text-success';
+            localUploadStatus.textContent = `Uploaded ${data.uploaded || 0} file(s).`;
+            localFileInput.value = '';
+            await loadLocalFiles();
+        }
+    } catch {
+        localUploadStatus.className = 'is-size-7 mb-3 has-text-danger';
+        localUploadStatus.textContent = 'Network error.';
+    } finally {
+        localUploadLabel.classList.remove('is-loading');
+    }
+}
+
+async function deleteLocalFile(folder, name) {
+    if (!confirm(`Delete "${name}"?`)) return;
+    try {
+        const f = folder ? `${encodeURIComponent(folder)}/` : '';
+        await fetch(`/api/local/${encodeURIComponent(currentChannel)}/files/${f}${encodeURIComponent(name)}`,
+                    { method: 'DELETE' });
+        await loadLocalFiles();
+    } catch (e) {
+        console.error('Failed to delete local file', e);
+    }
+}
+
+async function playLocalNow(folder, name) {
+    if (!currentChannel) return;
+    try {
+        const path = folder ? `${encodeURIComponent(folder)}/` : '';
+        const res = await fetch(
+            `/api/local/${encodeURIComponent(currentChannel)}/play/${path}${encodeURIComponent(name)}`,
+            { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) {
+            alert(data.error || 'Failed to play file.');
+        }
+        // queue:update via socket.io will refresh both dashboard + overlay.
+    } catch (e) {
+        console.error('Failed to play local file', e);
+        alert('Network error.');
+    }
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
@@ -362,6 +583,7 @@ function switchChannel(channel) {
     loadMedia();
     loadMode();
     if (activeQueueTab === 'mylist') loadMyList();
+    if (activeQueueTab === 'local')  { loadLocalFolders(); loadLocalFiles(); }
 }
 
 // Copy the OBS browser-source URL to the clipboard. Works on HTTPS/localhost via

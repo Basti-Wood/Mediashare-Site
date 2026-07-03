@@ -99,6 +99,49 @@ audioEl.preload  = 'auto';
 audioEl.autoplay = true;
 audioEl.volume   = 1;
 
+// ── Audio normalisation (Web Audio API dynamics compressor) ──────────────────
+// Routes the <audio> element through a compressor so quiet and loud tracks are
+// levelled to roughly the same perceived loudness. The audio element keeps
+// playing in background tabs; the compressor is transparent to that guarantee.
+
+let audioCtx       = null;
+let compressorNode = null;
+
+function initAudioNormalisation() {
+    if (audioCtx) return;
+    try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        audioCtx = new AC();
+        const source = audioCtx.createMediaElementSource(audioEl);
+        compressorNode = audioCtx.createDynamicsCompressor();
+
+        // Fairly aggressive normalisation — pulls everything toward a uniform level.
+        compressorNode.threshold.setValueAtTime(-24, audioCtx.currentTime);
+        compressorNode.knee.setValueAtTime(30, audioCtx.currentTime);
+        compressorNode.ratio.setValueAtTime(12, audioCtx.currentTime);
+        compressorNode.attack.setValueAtTime(0.003, audioCtx.currentTime);
+        compressorNode.release.setValueAtTime(0.25, audioCtx.currentTime);
+
+        source.connect(compressorNode);
+        compressorNode.connect(audioCtx.destination);
+
+        console.log('Audio normalisation active (Web Audio API compressor).');
+    } catch (e) {
+        console.warn('Audio normalisation unavailable:', e?.message || e);
+    }
+}
+
+// AudioContexts are suspended until a user gesture — resume on interaction.
+['click', 'keydown', 'touchstart', 'pointerdown'].forEach(ev =>
+    window.addEventListener(ev, () => {
+        if (audioCtx && audioCtx.state === 'suspended') {
+            audioCtx.resume().catch(() => {});
+        }
+    }, { passive: true }));
+
+initAudioNormalisation();
+
 // ── Controls (visible when ?controls=1) ───────────────────────────────────────
 
 let pollTimer  = null;
@@ -508,6 +551,37 @@ function playSpotify(info) {
         `https://open.spotify.com/embed/${info.type}/${info.id}?utm_source=generator&autoplay=1`;
 }
 
+// Play a local MP3 file through the native <audio> element.
+// The file is served by our own backend at /api/local-media/....
+function playLocalAudio(item) {
+    const url = item.url || item.media || '';
+    const title = item.song_name || item.title || 'Local File';
+
+    idleScreen.style.display   = 'none';
+    ytContainer.style.display  = 'none';
+    spotifyFrame.style.display = 'none';
+    clearYouTubeFallbackTimer();
+    stopPoll();
+    if (CONTROLS && seekBar)     { seekBar.value = 0; seekBar.disabled = false; }
+    if (CONTROLS && timeDisplay) timeDisplay.textContent = title;
+
+    // Route through the normalised audio element.
+    audioEl.src = url;
+    if (CONTROLS && volumeBar) {
+        const vol = Number(volumeBar.value);
+        audioEl.muted  = vol === 0;
+        audioEl.volume = Math.max(0, Math.min(1, vol / 100));
+    } else {
+        audioEl.muted  = false;
+        audioEl.volume = 1;
+    }
+    const p = audioEl.play();
+    if (p && p.catch) {
+        p.catch(err => console.warn('Local audio autoplay blocked:', err?.message || err));
+    }
+    if (CONTROLS) startPoll();
+}
+
 function playItem(item) {
     if (!item) { showIdle(); return; }
 
@@ -525,6 +599,16 @@ function playItem(item) {
     if (platform === 'spotify' || getSpotifyInfo(url)) {
         const info = getSpotifyInfo(url);
         if (info) { playSpotify(info); return; }
+    }
+
+    // Local MP3 files served by our own backend.
+    // Basti may or may not preserve the 'platform' field and may encode '/'
+    // in the URL — detect by the local-media path segment (encoded or not).
+    if (platform === 'local' || /(\/|%2F)api(\/|%2F)local-media(\/|%2F)/.test(url)) {
+        // Ensure we have a clean, decoded URL for the audio element.
+        const cleanUrl = decodeURIComponent(url);
+        playLocalAudio({ ...item, url: cleanUrl, media: cleanUrl });
+        return;
     }
 
     const ytId = getYouTubeId(url);

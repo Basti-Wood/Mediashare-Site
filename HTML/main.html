@@ -107,6 +107,7 @@
                     <ul>
                         <li class="is-active" data-tab="requests"><a>Viewer Requests</a></li>
                         <li data-tab="mylist"><a>My List</a></li>
+                        <li data-tab="local"><a>Local Files</a></li>
                     </ul>
                 </div>
 
@@ -177,6 +178,75 @@
                             </tr>
                         </thead>
                         <tbody id="mylist-tbody"></tbody>
+                    </table>
+                </div>
+
+                <!-- ── Local Files panel ── -->
+                <div id="panel-local" style="display:none">
+                    <!-- Folder creation -->
+                    <div class="field has-addons mb-1">
+                        <div class="control is-expanded">
+                            <input id="local-folder-input" class="input is-small" type="text"
+                                   placeholder="New folder name…">
+                        </div>
+                        <div class="control">
+                            <button id="local-folder-create-btn" class="button is-small is-link">
+                                Create Folder
+                            </button>
+                        </div>
+                    </div>
+                    <p id="local-folder-status" class="is-size-7 mb-3"></p>
+
+                    <!-- File upload -->
+                    <div class="field has-addons mb-1">
+                        <div class="control is-expanded">
+                            <div class="select is-small is-fullwidth" id="local-folder-select-wrap">
+                                <select id="local-folder-select">
+                                    <option value="">(root)</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="control">
+                            <label class="button is-small is-link" for="local-file-input"
+                                   id="local-upload-label">Upload MP3</label>
+                            <input id="local-file-input" class="is-hidden" type="file"
+                                   accept=".mp3,audio/mpeg" multiple>
+                        </div>
+                    </div>
+                    <p id="local-upload-status" class="is-size-7 mb-3"></p>
+
+                    <!-- Folder list -->
+                    <div class="level mb-2">
+                        <div class="level-left">
+                            <p class="heading level-item">Folders</p>
+                        </div>
+                    </div>
+                    <div id="local-folder-list" class="mb-3"></div>
+
+                    <!-- File list -->
+                    <div class="level mb-2">
+                        <div class="level-left">
+                            <p class="heading level-item">
+                                Files&nbsp;<span id="local-file-count" class="tag is-dark">0</span>
+                            </p>
+                        </div>
+                    </div>
+
+                    <div id="local-file-empty" class="has-text-centered has-text-grey py-4">
+                        No local files yet.
+                    </div>
+
+                    <table class="table is-fullwidth is-hoverable is-narrow"
+                           id="local-file-table" style="display:none">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>File</th>
+                                <th>Folder</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="local-file-tbody"></tbody>
                     </table>
                 </div>
 
