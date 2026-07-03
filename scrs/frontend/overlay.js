@@ -99,48 +99,14 @@ audioEl.preload  = 'auto';
 audioEl.autoplay = true;
 audioEl.volume   = 1;
 
-// ── Audio normalisation (Web Audio API dynamics compressor) ──────────────────
-// Routes the <audio> element through a compressor so quiet and loud tracks are
-// levelled to roughly the same perceived loudness. The audio element keeps
-// playing in background tabs; the compressor is transparent to that guarantee.
-
-let audioCtx       = null;
-let compressorNode = null;
-
-function initAudioNormalisation() {
-    if (audioCtx) return;
-    try {
-        const AC = window.AudioContext || window.webkitAudioContext;
-        if (!AC) return;
-        audioCtx = new AC();
-        const source = audioCtx.createMediaElementSource(audioEl);
-        compressorNode = audioCtx.createDynamicsCompressor();
-
-        // Fairly aggressive normalisation — pulls everything toward a uniform level.
-        compressorNode.threshold.setValueAtTime(-24, audioCtx.currentTime);
-        compressorNode.knee.setValueAtTime(30, audioCtx.currentTime);
-        compressorNode.ratio.setValueAtTime(12, audioCtx.currentTime);
-        compressorNode.attack.setValueAtTime(0.003, audioCtx.currentTime);
-        compressorNode.release.setValueAtTime(0.25, audioCtx.currentTime);
-
-        source.connect(compressorNode);
-        compressorNode.connect(audioCtx.destination);
-
-        console.log('Audio normalisation active (Web Audio API compressor).');
-    } catch (e) {
-        console.warn('Audio normalisation unavailable:', e?.message || e);
-    }
-}
-
-// AudioContexts are suspended until a user gesture — resume on interaction.
-['click', 'keydown', 'touchstart', 'pointerdown'].forEach(ev =>
-    window.addEventListener(ev, () => {
-        if (audioCtx && audioCtx.state === 'suspended') {
-            audioCtx.resume().catch(() => {});
-        }
-    }, { passive: true }));
-
-initAudioNormalisation();
+// ── Audio normalisation ───────────────────────────────────────────────────────
+// Loudness normalisation now happens server-side (ffmpeg loudnorm) for both the
+// YouTube proxy (/api/yt-audio/:id) and local MP3 uploads, so every track
+// already arrives at the same target loudness. We intentionally do NOT route
+// this element through the Web Audio API (createMediaElementSource) — browsers
+// silently mute any media element connected to Web Audio if its underlying
+// resource is cross-origin without CORS headers, which is exactly what broke
+// playback here previously.
 
 // ── Controls (visible when ?controls=1) ───────────────────────────────────────
 

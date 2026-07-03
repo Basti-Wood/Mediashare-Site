@@ -6,7 +6,7 @@ const session  = require('express-session');
 const http     = require('http');
 const path     = require('path');
 const fs       = require('fs');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const multer   = require('multer');
 const WebSocket = require('ws');
 const { Server } = require('socket.io');
@@ -702,12 +702,25 @@ async function promoteMyListHeadToBasti(ch) {
 // overlay play it through a normal same-origin <audio> element, which the browser
 // does NOT suspend in the background.
 //
-// The endpoint 302-redirects to the resolved googlevideo URL (cheap — we don't
-// proxy the audio bytes). Those URLs are signed and time-limited (a few hours),
-// so we cache them briefly to avoid spawning yt-dlp on every play.
+// We used to 302-redirect straight to the resolved googlevideo URL (cheap — no
+// proxying). That broke sound entirely once the overlay started routing the
+// <audio> element through the Web Audio API (for loudness normalisation):
+// browsers silently mute any MediaElementAudioSourceNode whose underlying
+// resource is cross-origin without CORS headers, and googlevideo does not send
+// them. So instead we proxy-transcode the resolved URL through ffmpeg — this
+// also lets us apply EBU R128 loudness normalisation (loudnorm) so every track
+// plays back at the same perceived volume, same-origin, no CORS issues.
+//
+// The resolved googlevideo URL is signed and time-limited (a few hours), so we
+// cache it briefly to avoid spawning yt-dlp on every play.
 
 const ytAudioCache = new Map(); // videoId -> { url, expires }
 const YT_AUDIO_TTL_MS = 90 * 60 * 1000; // 90 min — comfortably inside the signed-URL lifetime
+
+// Target loudness for all normalised playback (YouTube proxy + local uploads).
+// -14 LUFS matches the common streaming-platform target (Spotify/YouTube/Apple
+// Music), so songs from different sources end up at a consistent volume.
+const LOUDNORM_FILTER = 'loudnorm=I=-14:TP=-1.5:LRA=11';
 
 function resolveYouTubeAudioUrl(videoId) {
     return new Promise((resolve, reject) => {
@@ -738,29 +751,78 @@ function resolveYouTubeAudioUrl(videoId) {
     });
 }
 
-// GET a direct audio stream for a YouTube video id. Redirects to the resolved
-// googlevideo URL. No auth: the overlay (OBS browser source / background tab)
-// has no session, same as the other /api/channels endpoints.
+// GET a same-origin, loudness-normalised audio stream for a YouTube video id.
+// No auth: the overlay (OBS browser source / background tab) has no session,
+// same as the other /api/channels endpoints.
 app.get('/api/yt-audio/:videoId', async (req, res) => {
     const videoId = String(req.params.videoId || '');
     if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
         return res.status(400).json({ error: 'Invalid video id.' });
     }
 
+    let sourceUrl;
     const cached = ytAudioCache.get(videoId);
     if (cached && cached.expires > Date.now()) {
-        return res.redirect(302, cached.url);
+        sourceUrl = cached.url;
+    } else {
+        try {
+            sourceUrl = await resolveYouTubeAudioUrl(videoId);
+            ytAudioCache.set(videoId, { url: sourceUrl, expires: Date.now() + YT_AUDIO_TTL_MS });
+        } catch (e) {
+            console.error(`yt-dlp failed for ${videoId}:`, e.message || e);
+            return res.status(502).json({ error: 'Could not resolve audio stream.' });
+        }
     }
 
-    try {
-        const url = await resolveYouTubeAudioUrl(videoId);
-        ytAudioCache.set(videoId, { url, expires: Date.now() + YT_AUDIO_TTL_MS });
-        return res.redirect(302, url);
-    } catch (e) {
-        console.error(`yt-dlp failed for ${videoId}:`, e.message || e);
-        return res.status(502).json({ error: 'Could not resolve audio stream.' });
-    }
+    streamNormalizedAudio(sourceUrl, res, videoId);
 });
+
+// Transcodes a (possibly remote) audio source through ffmpeg with loudness
+// normalisation and streams the result to the client same-origin. `res` must
+// not have been responded to yet.
+function streamNormalizedAudio(sourceUrl, res, label) {
+    const ff = spawn('ffmpeg', [
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
+        '-i', sourceUrl,
+        '-vn',
+        '-af', LOUDNORM_FILTER,
+        '-f', 'mp3',
+        '-b:a', '192k',
+        'pipe:1'
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let sentData = false;
+    let stderrTail = '';
+    ff.stderr.on('data', chunk => {
+        stderrTail = (stderrTail + chunk.toString()).slice(-2000);
+    });
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store');
+
+    ff.stdout.once('data', () => { sentData = true; });
+    ff.stdout.pipe(res);
+
+    ff.on('error', err => {
+        console.error(`ffmpeg failed to start for ${label}:`, err.message || err);
+        if (!res.headersSent) res.status(502).json({ error: 'Audio transcode failed.' });
+    });
+
+    ff.on('close', code => {
+        if (code !== 0 && !sentData) {
+            console.error(`ffmpeg exited ${code} for ${label}:`, stderrTail.trim());
+            if (!res.headersSent) res.status(502).json({ error: 'Audio transcode failed.' });
+        }
+        if (!res.writableEnded) res.end();
+    });
+
+    // Client changed/skipped tracks — stop transcoding immediately.
+    res.on('close', () => {
+        if (!ff.killed) ff.kill('SIGKILL');
+    });
+}
 
 // ── Overlay endpoints (no auth — used by OBS browser source) ─────────────────
 
@@ -992,17 +1054,54 @@ app.post('/api/local/:channel/upload', requireAuth, (req, res, next) => {
 app.post('/api/local/:channel/upload/:folder', requireAuth, (req, res) => {
     if (!hasAccess(req.session.user, req.params.channel))
         return res.status(403).json({ error: 'Access denied.' });
-    localUpload.array('files', 20)(req, res, err => {
+    localUpload.array('files', 20)(req, res, async err => {
         if (err) {
             const msg = String(err.message || err);
             if (msg.includes('Only MP3')) return res.status(400).json({ error: msg });
             return res.status(500).json({ error: msg });
         }
-        const uploaded = (req.files || []).length;
+        const files = req.files || [];
+        for (const f of files) {
+            try {
+                await normalizeAudioFile(f.path);
+            } catch (e) {
+                console.error(`Loudness normalisation failed for ${f.path}:`, e.message || e);
+            }
+        }
         io.to(`ch:${req.params.channel}`).emit('queue:update', { channel: req.params.channel });
-        res.json({ success: true, uploaded });
+        res.json({ success: true, uploaded: files.length });
     });
 });
+
+// Re-encodes an uploaded MP3 in place to a consistent loudness target (see
+// LOUDNORM_FILTER) so local uploads sound the same volume as YouTube tracks
+// and each other. Runs once at upload time (not per-play), so Range/seek
+// support on playback is unaffected.
+function normalizeAudioFile(filePath) {
+    return new Promise((resolve, reject) => {
+        const tmpPath = `${filePath}.norm.tmp.mp3`;
+        const ff = spawn('ffmpeg', [
+            '-y',
+            '-i', filePath,
+            '-af', LOUDNORM_FILTER,
+            '-b:a', '192k',
+            tmpPath
+        ], { stdio: ['ignore', 'ignore', 'pipe'] });
+
+        let stderrTail = '';
+        ff.stderr.on('data', chunk => {
+            stderrTail = (stderrTail + chunk.toString()).slice(-2000);
+        });
+        ff.on('error', reject);
+        ff.on('close', code => {
+            if (code !== 0) {
+                fs.rm(tmpPath, { force: true }, () => {});
+                return reject(new Error(stderrTail.trim() || `ffmpeg exited ${code}`));
+            }
+            fs.rename(tmpPath, filePath, err => err ? reject(err) : resolve());
+        });
+    });
+}
 
 // Delete a single file
 app.delete('/api/local/:channel/files/:folder/:filename', requireAuth, (req, res) => {
