@@ -978,11 +978,13 @@ function localMediaDir(channel, folder = '') {
 
 function sanitisePath(segment) {
     // Strip anything that isn't a safe filename character; collapse dots & slashes.
+    // Returns '' for empty/blank input — callers must handle empty segments
+    // (e.g. path.join already ignores empty strings).
     return String(segment || '')
         .replace(/\.\./g, '')
         .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
         .replace(/^\.+/, '')
-        .trim() || '_';
+        .trim();
 }
 
 // Multer storage: keep original filename (sanitised), organised by channel/folder.
@@ -1001,7 +1003,10 @@ const localUpload = multer({
     }),
     fileFilter(req, file, cb) {
         const ext = path.extname(file.originalname).toLowerCase();
-        if (ext !== '.mp3' && file.mimetype !== 'audio/mpeg') {
+        const mime = (file.mimetype || '').toLowerCase();
+        // Accept .mp3 extension OR any common MP3 MIME type (browsers/OSes vary).
+        const validMime = ['audio/mpeg', 'audio/mp3', 'audio/x-mp3', 'audio/mpeg3', 'audio/x-mpeg'].includes(mime);
+        if (ext !== '.mp3' && !validMime) {
             return cb(new Error('Only MP3 files are allowed.'));
         }
         cb(null, true);
