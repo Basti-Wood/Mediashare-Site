@@ -36,6 +36,7 @@ const panelRequests   = document.getElementById('panel-requests');
 const panelMylist     = document.getElementById('panel-mylist');
 const mylistUrlInput  = document.getElementById('mylist-url-input');
 const mylistAddBtn    = document.getElementById('mylist-add-btn');
+const mylistClearBtn  = document.getElementById('mylist-clear-btn');
 const mylistAddStatus = document.getElementById('mylist-add-status');
 const mylistCount     = document.getElementById('mylist-count');
 const mylistEmpty     = document.getElementById('mylist-empty');
@@ -234,6 +235,18 @@ async function removeFromMyList(index) {
     }
 }
 
+async function clearMyList() {
+    if (!confirm('Are you sure you want to clear the entire My List?')) return;
+    try {
+        const res = await fetch(`/api/mylist/${encodeURIComponent(currentChannel)}`,
+                    { method: 'DELETE' });
+        if (!res.ok) throw new Error(res.status);
+        await loadMyList();
+    } catch (e) {
+        console.error('Failed to clear my list', e);
+    }
+}
+
 // ── Queue-type tab switching ──────────────────────────────────────────────────
 
 function setupQueueTypeTabs() {
@@ -254,6 +267,7 @@ function setupQueueTypeTabs() {
     mylistUrlInput.addEventListener('keydown', e => {
         if (e.key === 'Enter') addToMyList(mylistUrlInput.value);
     });
+    mylistClearBtn.addEventListener('click', () => clearMyList());
 
     // Local-files event wiring
     localFolderCreateBtn.addEventListener('click', createLocalFolder);

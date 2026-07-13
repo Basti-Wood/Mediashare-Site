@@ -277,6 +277,10 @@ function getMode(channel) {
 // Keep loadChannelMyList / saveChannelMyList as thin wrappers so existing call-sites stay untouched
 function loadChannelMyList(channel) { return { items: getMyList(channel) }; }
 function saveChannelMyList(channel, data) { mylistByChannel.set(channel, data.items || []); }
+
+function clearChannelMyList(channel) { getMyList(channel).length = 0; }
+
+
 function loadChannelMode(channel) { return getMode(channel); }
 function saveChannelMode(channel, data) { modeByChannel.set(channel, data); }
 
@@ -387,11 +391,44 @@ async function expandYouTubePlaylistViaScrape(playlistId) {
     } catch (e) { console.error('Playlist scrape error:', e.message); return null; }
 }
 
+async function expandYouTubePlaylistViaYtDlp(playlistId) {
+    return new Promise((resolve, reject) => {
+        // --flat-playlist: only list videos, don't resolve each one (fast).
+        // --print id:     output just the video ID on each line.
+        // --no-playlist:  ensure a bare ID isn't treated as a playlist.
+        execFile(
+            'yt-dlp',
+            [
+                '--flat-playlist',
+                '--print', 'id',
+                '--no-playlist',
+                '--no-warnings',
+                `https://www.youtube.com/playlist?list=${playlistId}`
+            ],
+            { timeout: 60000, maxBuffer: 10 * 1024 * 1024 },
+            (err, stdout, stderr) => {
+                if (err) return reject(new Error(String(stderr || err.message).trim()));
+                const ids = String(stdout).trim().split(/\r?\n/).filter(id => /^[A-Za-z0-9_-]{11}$/.test(id));
+                if (ids.length === 0) return reject(new Error('yt-dlp returned no video IDs'));
+                const now = new Date().toISOString();
+                const items = ids.map(id => ({
+                    url:      `https://www.youtube.com/watch?v=${id}`,
+                    title:    'Unknown Title',
+                    platform: 'youtube',
+                    addedAt:  now
+                }));
+                console.log(`yt-dlp resolved ${items.length} videos from playlist ${playlistId}`);
+                resolve(items);
+            }
+        );
+    });
+}
+
 async function expandYouTubePlaylist(playlistId) {
     const apiKey = process.env.YOUTUBE_API_KEY;
 
     if (apiKey) {
-        // Full expansion via YouTube Data API v3 (up to 200 items)
+        // Full expansion via YouTube Data API v3 (up to 2000 items)
         const items = [];
         let pageToken = '';
         let pages = 0;
@@ -420,11 +457,19 @@ async function expandYouTubePlaylist(playlistId) {
             }
             pageToken = data.nextPageToken || '';
             pages++;
-        } while (pageToken && pages < 10);
+        } while (pageToken && pages < 40);
         if (items.length > 0) return items;
     }
 
-    // Fallback: scrape the YouTube playlist page (no API key required)
+    // Fallback 1: yt-dlp --flat-playlist (no key needed, handles any size)
+    try {
+        const items = await expandYouTubePlaylistViaYtDlp(playlistId);
+        if (items && items.length > 0) return items;
+    } catch (e) {
+        console.warn(`yt-dlp playlist fallback failed for ${playlistId}:`, e.message || e);
+    }
+
+    // Fallback 2: scrape the YouTube playlist page (last resort)
     return expandYouTubePlaylistViaScrape(playlistId);
 }
 
@@ -632,6 +677,13 @@ app.post('/api/mylist/:owner/remove/:index', requireAuth, (req, res) => {
     data.items.splice(index, 1);
     saveChannelMyList(req.params.owner, data);
     res.json({ success: true, total: data.items.length });
+});
+
+app.delete('/api/mylist/:owner', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.owner))
+        return res.status(403).json({ error: 'Access denied.' });
+    clearChannelMyList(req.params.owner);
+    res.json({ success: true });
 });
 
 // ── Mode API ──────────────────────────────────────────────────────────────────
