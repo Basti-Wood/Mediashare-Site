@@ -27,6 +27,9 @@ const CONTROLS  = params.get('controls') === '1';
 //
 // Append &ytmode=iframe to fall back to the old iframe-audio behaviour if needed.
 const YT_AUDIO_MODE = params.get('ytmode') !== 'iframe';
+const MAX_VOLUME = 0.5; // 100% in the controls is half the previous maximum.
+let volumePercent = 100;
+let playbackMode = null; // 'youtube-audio', 'youtube', 'local', or 'spotify'
 
 let ytPlayer       = null;   // muted iframe player (video picture only, in audio mode)
 let ytApiReady     = false;
@@ -97,7 +100,7 @@ const spotifyFrame  = document.getElementById('spotify-player');
 const audioEl = new Audio();
 audioEl.preload  = 'auto';
 audioEl.autoplay = true;
-audioEl.volume   = 1;
+audioEl.volume   = MAX_VOLUME;
 
 // ── Audio normalisation ───────────────────────────────────────────────────────
 // Loudness normalisation now happens server-side (ffmpeg loudnorm) for both the
@@ -116,101 +119,128 @@ let isSeeking  = false;
 const ctrlPanel   = CONTROLS ? document.getElementById('player-controls') : null;
 const seekBar     = CONTROLS ? document.getElementById('seek-bar')        : null;
 const volumeBar   = CONTROLS ? document.getElementById('volume-bar')      : null;
+const volumeInput = CONTROLS ? document.getElementById('volume-percent')  : null;
 const timeDisplay = CONTROLS ? document.getElementById('time-display')    : null;
 
 function formatTime(sec) {
-    sec = Math.floor(sec || 0);
+    sec = Number.isFinite(sec) ? Math.max(0, Math.floor(sec)) : 0;
     const m = Math.floor(sec / 60);
     const s = sec % 60;
     return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-// In audio mode the seek/volume/time all read from the <audio> element.
+function usesNativeAudio() {
+    return playbackMode === 'youtube-audio' || playbackMode === 'local';
+}
+
+function getPlaybackDuration() {
+    if (usesNativeAudio() && Number.isFinite(audioEl.duration) && audioEl.duration > 0) {
+        return audioEl.duration;
+    }
+    // The transcoded MP3 stream has no length header and can report Infinity.
+    // Use the matching video duration, while keeping the audio clock authoritative.
+    if ((playbackMode === 'youtube-audio' || playbackMode === 'youtube') &&
+        ytPlayer && typeof ytPlayer.getDuration === 'function') {
+        try {
+            const duration = ytPlayer.getDuration();
+            if (Number.isFinite(duration) && duration > 0) return duration;
+        } catch { /* player may still be loading */ }
+    }
+    return 0;
+}
+
+function updateProgress() {
+    if (!CONTROLS || isSeeking || !playbackMode || playbackMode === 'spotify') return;
+    let current = 0;
+    if (usesNativeAudio()) current = audioEl.currentTime;
+    else if (ytPlayer && typeof ytPlayer.getCurrentTime === 'function') {
+        try { current = ytPlayer.getCurrentTime(); } catch { return; }
+    }
+    const duration = getPlaybackDuration();
+    seekBar.value = duration > 0 ? Math.max(0, Math.min(100, current / duration * 100)) : 0;
+    timeDisplay.textContent = `${formatTime(current)} / ${duration > 0 ? formatTime(duration) : '--:--'}`;
+}
+
 function startPoll() {
-    if (!CONTROLS || pollTimer) return;
-    pollTimer = setInterval(() => {
-        if (isSeeking) return;
-        if (YT_AUDIO_MODE) {
-            const dur = audioEl.duration;
-            const cur = audioEl.currentTime;
-            if (dur > 0 && isFinite(dur)) {
-                seekBar.value = (cur / dur) * 100;
-                timeDisplay.textContent = `${formatTime(cur)} / ${formatTime(dur)}`;
-            }
-            return;
-        }
-        if (!ytPlayer || typeof ytPlayer.getCurrentTime !== 'function') return;
-        const state = typeof ytPlayer.getPlayerState === 'function' ? ytPlayer.getPlayerState() : -1;
-        if (state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.PAUSED) return;
-        const dur = ytPlayer.getDuration();
-        const cur = ytPlayer.getCurrentTime();
-        if (dur > 0) {
-            seekBar.value = (cur / dur) * 100;
-            timeDisplay.textContent = `${formatTime(cur)} / ${formatTime(dur)}`;
-        }
-    }, 500);
+    if (!CONTROLS) return;
+    updateProgress();
+    if (!pollTimer) pollTimer = setInterval(updateProgress, 250);
 }
 
 function stopPoll() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
 }
 
+function applyVolume(value = volumePercent, player = ytPlayer) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return;
+    volumePercent = Math.max(0, Math.min(100, parsed));
+    if (volumeBar) volumeBar.value = volumePercent;
+    // Avoid rewriting a matching value while typing a decimal (e.g. "12.").
+    if (volumeInput && (volumeInput.value === '' || Number(volumeInput.value) !== volumePercent)) {
+        volumeInput.value = volumePercent;
+    }
+    const level = volumePercent / 100 * MAX_VOLUME;
+    audioEl.volume = level;
+    audioEl.muted = level === 0;
+    if (playbackMode === 'youtube' && player && typeof player.setVolume === 'function') {
+        player.setVolume(level * 100);
+        if (level === 0) player.mute();
+        else player.unMute();
+    }
+}
+
 if (CONTROLS) {
     ctrlPanel.style.display = 'flex';
 
-    // Seek
-    seekBar.addEventListener('mousedown',  () => { isSeeking = true; });
-    seekBar.addEventListener('touchstart', () => { isSeeking = true; }, { passive: true });
+    // Release seeking even when a drag ends outside the slider or is cancelled.
+    seekBar.addEventListener('pointerdown', () => { isSeeking = true; });
+    window.addEventListener('pointerup', () => { isSeeking = false; });
+    window.addEventListener('pointercancel', () => { isSeeking = false; });
+    seekBar.addEventListener('blur', () => { isSeeking = false; });
     seekBar.addEventListener('input', () => {
-        let dur;
-        if (YT_AUDIO_MODE) dur = audioEl.duration;
-        else if (ytPlayer && typeof ytPlayer.getDuration === 'function') dur = ytPlayer.getDuration();
-        if (!dur || isNaN(dur) || !isFinite(dur)) return;
-        const sec = (seekBar.value / 100) * dur;
-        timeDisplay.textContent = `${formatTime(sec)} / ${formatTime(dur)}`;
+        const duration = getPlaybackDuration();
+        if (!duration) return;
+        const seconds = seekBar.value / 100 * duration;
+        timeDisplay.textContent = `${formatTime(seconds)} / ${formatTime(duration)}`;
     });
     seekBar.addEventListener('change', () => {
         isSeeking = false;
-        if (YT_AUDIO_MODE) {
-            const dur = audioEl.duration;
-            if (!dur || isNaN(dur) || !isFinite(dur)) return;
-            audioEl.currentTime = (seekBar.value / 100) * dur;
-            // Keep the muted video picture roughly in sync if it's present.
-            if (ytPlayer && typeof ytPlayer.seekTo === 'function') {
-                try { ytPlayer.seekTo(audioEl.currentTime, true); } catch {}
+        const duration = getPlaybackDuration();
+        if (!duration) return;
+        const seconds = seekBar.value / 100 * duration;
+        if (usesNativeAudio()) {
+            audioEl.currentTime = seconds;
+            if (playbackMode === 'youtube-audio' && ytPlayer && typeof ytPlayer.seekTo === 'function') {
+                try { ytPlayer.seekTo(seconds, true); } catch {}
             }
-            return;
+        } else if (playbackMode === 'youtube' && ytPlayer && typeof ytPlayer.seekTo === 'function') {
+            ytPlayer.seekTo(seconds, true);
         }
-        if (!ytPlayer || typeof ytPlayer.seekTo !== 'function') return;
-        const dur = ytPlayer.getDuration();
-        if (!dur || isNaN(dur)) return;
-        ytPlayer.seekTo((seekBar.value / 100) * dur, true);
     });
 
-    // Volume
-    volumeBar.addEventListener('input', () => {
-        const vol = Number(volumeBar.value);
-        if (YT_AUDIO_MODE) {
-            audioEl.muted  = vol === 0;
-            audioEl.volume = Math.max(0, Math.min(1, vol / 100));
-            return;
-        }
-        if (!ytPlayer || typeof ytPlayer.setVolume !== 'function') return;
-        if (vol === 0) { ytPlayer.mute(); }
-        else { ytPlayer.unMute(); ytPlayer.setVolume(vol); }
+    volumeBar.addEventListener('input', () => applyVolume(volumeBar.value));
+    volumeInput.addEventListener('input', () => {
+        // Leave an empty field editable while the user replaces its value.
+        if (volumeInput.value !== '') applyVolume(volumeInput.value);
     });
+    volumeInput.addEventListener('change', () => applyVolume(
+        volumeInput.value === '' ? volumePercent : volumeInput.value
+    ));
+    applyVolume();
 }
-
-// ── Audio element events (audio-mode playback authority) ───────────────────────
 
 audioEl.addEventListener('ended', () => { advance(); });
 audioEl.addEventListener('error', () => {
-    if (!audioEl.src) return;            // ignore the empty-src reset
+    if (!audioEl.src) return;
     console.error('Audio element error, advancing.');
     advance();
 });
-audioEl.addEventListener('playing', () => { if (CONTROLS) startPoll(); });
-audioEl.addEventListener('pause',   () => { /* keep poll; user may resume via seek */ });
+audioEl.addEventListener('playing', () => {
+    if (usesNativeAudio()) startPoll();
+});
+['timeupdate', 'durationchange', 'loadedmetadata', 'seeked'].forEach(event =>
+    audioEl.addEventListener(event, updateProgress));
 
 function clearYouTubeFallbackTimer() {
     if (ytFallbackTimer) {
@@ -222,7 +252,7 @@ function clearYouTubeFallbackTimer() {
 function fallbackEmbed(videoId) {
     // Use enablejsapi=1 so we can still drive seek/volume from the controls.
     const origin = encodeURIComponent(window.location.origin);
-    const src = `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?enablejsapi=1&autoplay=1&controls=0&rel=0&modestbranding=1&playsinline=1&origin=${origin}`;
+    const src = `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?enablejsapi=1&autoplay=1&mute=1&controls=0&rel=0&modestbranding=1&playsinline=1&origin=${origin}`;
     ytContainer.innerHTML = `
         <iframe
             id="yt-fallback-iframe"
@@ -248,8 +278,7 @@ function fallbackEmbed(videoId) {
                             // Video picture only — never let the iframe make sound.
                             event.target.mute();
                         } else {
-                            event.target.unMute();
-                            if (CONTROLS && volumeBar) event.target.setVolume(Number(volumeBar.value));
+                            applyVolume(volumePercent, event.target);
                             startPoll();
                             startWatchdog();
                         }
@@ -353,6 +382,8 @@ function stopAudio() {
 }
 
 function showIdle() {
+    playbackMode = null;
+    isSeeking = false;
     idleScreen.style.display   = 'flex';
     ytContainer.style.display  = 'none';
     spotifyFrame.style.display = 'none';
@@ -370,6 +401,8 @@ function showIdle() {
 // Audio-mode YouTube playback: native <audio> drives sound + timing; the muted
 // iframe (if the API is ready) just shows the picture.
 function playYouTubeAudioMode(videoId) {
+    playbackMode = 'youtube-audio';
+    isSeeking = false;
     idleScreen.style.display   = 'none';
     spotifyFrame.style.display = 'none';
     ytContainer.style.display  = 'block';
@@ -379,14 +412,7 @@ function playYouTubeAudioMode(videoId) {
 
     // 1) Start the audio (the part that must survive a background tab).
     audioEl.src = `/api/yt-audio/${encodeURIComponent(videoId)}`;
-    if (CONTROLS && volumeBar) {
-        const vol = Number(volumeBar.value);
-        audioEl.muted  = vol === 0;
-        audioEl.volume = Math.max(0, Math.min(1, vol / 100));
-    } else {
-        audioEl.muted  = false;
-        audioEl.volume = 1;
-    }
+    applyVolume();
     const p = audioEl.play();
     if (p && p.catch) {
         p.catch(err => {
@@ -433,6 +459,8 @@ function playYouTubeAudioMode(videoId) {
 
 function playYouTube(videoId) {
     if (YT_AUDIO_MODE) { playYouTubeAudioMode(videoId); return; }
+    playbackMode = 'youtube';
+    isSeeking = false;
 
     // ── Legacy iframe-audio mode (&ytmode=iframe) ──
     idleScreen.style.display   = 'none';
@@ -465,6 +493,7 @@ function playYouTube(videoId) {
             videoId,
             playerVars: {
                 autoplay:       1,
+                mute:           1,
                 playsinline:    1,
                 controls:       0,
                 rel:            0,
@@ -474,8 +503,7 @@ function playYouTube(videoId) {
             },
             events: {
                 onReady(event) {
-                    event.target.unMute();
-                    if (CONTROLS && volumeBar) event.target.setVolume(Number(volumeBar.value));
+                    applyVolume(volumePercent, event.target);
                     event.target.playVideo();
                     startPoll();
                     startWatchdog();
@@ -496,14 +524,16 @@ function playYouTube(videoId) {
         });
     } else {
         ytPlayer.loadVideoById(videoId);
-        ytPlayer.unMute();
-        if (CONTROLS && volumeBar) ytPlayer.setVolume(Number(volumeBar.value));
+        applyVolume();
         ytPlayer.playVideo();
         startPoll();
     }
 }
 
 function playSpotify(info) {
+    playbackMode = 'spotify';
+    isSeeking = false;
+    destroyYouTubePlayer();
     idleScreen.style.display   = 'none';
     ytContainer.style.display  = 'none';
     spotifyFrame.style.display = 'block';
@@ -520,6 +550,9 @@ function playSpotify(info) {
 // Play a local MP3 file through the native <audio> element.
 // The file is served by our own backend at /api/local-media/....
 function playLocalAudio(item) {
+    playbackMode = 'local';
+    isSeeking = false;
+    destroyYouTubePlayer();
     const url = item.url || item.media || '';
     const title = item.song_name || item.title || 'Local File';
 
@@ -533,14 +566,7 @@ function playLocalAudio(item) {
 
     // Route through the normalised audio element.
     audioEl.src = url;
-    if (CONTROLS && volumeBar) {
-        const vol = Number(volumeBar.value);
-        audioEl.muted  = vol === 0;
-        audioEl.volume = Math.max(0, Math.min(1, vol / 100));
-    } else {
-        audioEl.muted  = false;
-        audioEl.volume = 1;
-    }
+    applyVolume();
     const p = audioEl.play();
     if (p && p.catch) {
         p.catch(err => console.warn('Local audio autoplay blocked:', err?.message || err));
@@ -601,7 +627,7 @@ window.onYouTubeIframeAPIReady = function () {
 // no-op.
 ['click', 'keydown', 'touchstart', 'pointerdown'].forEach(ev =>
     window.addEventListener(ev, () => {
-        if (YT_AUDIO_MODE && audioEl.src && audioEl.paused) {
+        if (usesNativeAudio() && audioEl.src && audioEl.paused) {
             audioEl.play().catch(() => {});
         }
     }, { passive: true }));
