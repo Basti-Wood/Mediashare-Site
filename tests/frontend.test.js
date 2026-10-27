@@ -1,0 +1,178 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const { setImmediate: nextTick } = require('node:timers/promises');
+const { createTestServer } = require('./helpers/server');
+
+// Exercise the real frontend event handlers against the real local API.
+// Minimal DOM/audio stand-ins keep this suite runnable without a browser or
+// live media services; these checks do not claim to verify visual layout.
+function frontend(h, file, cookie) {
+    const elements = new Map();
+    const errors = [];
+    const audios = [];
+    const plays = [];
+    function element(id) {
+        if (!elements.has(id)) elements.set(id, {
+            id, value: '', textContent: '', innerHTML: '', checked: false,
+            disabled: false, style: {}, dataset: {}, handlers: new Map(),
+            classList: { add() {}, remove() {}, toggle() {} },
+            addEventListener(event, handler) { this.handlers.set(event, handler); },
+            querySelectorAll() { return []; }, querySelector() { return null; },
+            async fire(event, data = {}) { return this.handlers.get(event)?.(data); }
+        });
+        return elements.get(id);
+    }
+    const tabs = ['requests', 'mylist', 'local'].map(tab => {
+        const li = element('tab-' + tab);
+        li.dataset.tab = tab;
+        return li;
+    });
+    element('queue-type-tabs').querySelectorAll = () => tabs;
+    const context = vm.createContext({
+        document: { getElementById: element, addEventListener() {}, visibilityState: 'visible', hidden: false },
+        window: { location: { origin: h.base, search: '?channel=alice&controls=1', href: '' }, addEventListener() {} },
+        navigator: {}, URLSearchParams,
+        console: { log() {}, warn() {}, error: (...args) => errors.push(args) },
+        setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 1; }, clearInterval() {},
+        io: () => ({ on() {}, emit() {} }),
+        fetch: (url, options = {}) => fetch(h.base + url, {
+            ...options, headers: { ...options.headers, ...(cookie ? { Cookie: cookie } : {}) }
+        }),
+        Audio: class {
+            constructor() { this.src = ''; this.paused = true; this.handlers = new Map(); audios.push(this); }
+            addEventListener(event, handler) { this.handlers.set(event, handler); }
+            play() { this.paused = false; plays.push(this.src); return Promise.resolve(); }
+            pause() { this.paused = true; }
+            load() {}
+            removeAttribute(name) { if (name === 'src') this.src = ''; }
+        }
+    });
+    const source = fs.readFileSync(path.resolve(__dirname, '../scrs/frontend', file), 'utf8');
+    const ready = vm.runInContext(source, context, { filename: file });
+    return { context, elements, errors, audios, plays, ready, run: code => vm.runInContext(code, context) };
+}
+
+async function until(predicate) {
+    for (let i = 0; i < 1000; i++) {
+        if (predicate()) return;
+        await nextTick();
+    }
+    throw new Error('Frontend did not reach expected state');
+}
+
+async function setup(t) {
+    const h = await createTestServer({ random: () => 0 });
+    t.after(() => h.close());
+    const cookie = await h.login();
+    h.api = (url, method = 'GET', body) => h.request(url, { method, body, cookie });
+    h.cookie = cookie;
+    h.add = id => h.api('/api/mylist/alice/add', 'POST', { url: 'https://youtu.be/' + id });
+    return h;
+}
+
+test('dashboard handlers save loop, shuffle the list and restore channel settings on reload', async t => {
+    const h = await setup(t);
+    const ui = frontend(h, 'main.js', h.cookie);
+    await ui.ready;
+    await ui.run('loadMode()');
+    await ui.elements.get('tab-mylist').fire('click');
+    await ui.run('loadMyList()');
+    const shuffle = ui.elements.get('mylist-shuffle-btn');
+    assert.equal(shuffle.disabled, true);
+    const input = ui.elements.get('mylist-url-input');
+    const add = ui.elements.get('mylist-add-btn');
+    input.value = 'https://youtu.be/AAAAAAAAAAA';
+    await add.fire('click');
+    assert.equal(shuffle.disabled, true);
+    input.value = 'https://youtu.be/BBBBBBBBBBB';
+    await add.fire('click');
+    assert.equal(shuffle.disabled, false);
+    const loop = ui.elements.get('mylist-loop-toggle');
+    loop.checked = true;
+    await loop.fire('change');
+    assert.equal((await h.api('/api/mode/alice')).data.mylistLoop, true);
+    assert.equal(ui.elements.get('mylist-playback-status').textContent, 'Loop on.');
+    const before = (await h.api('/api/mylist/alice')).data.items.map(item => item.title);
+    await shuffle.fire('click');
+    const after = (await h.api('/api/mylist/alice')).data.items.map(item => item.title);
+    assert.deepEqual(after, before.reverse());
+    assert.equal(ui.elements.get('mylist-playback-status').textContent, 'My List shuffled.');
+    const reload = frontend(h, 'main.js', h.cookie);
+    await reload.ready;
+    await reload.run('loadMode()');
+    assert.equal(reload.elements.get('mylist-loop-toggle').checked, true);
+    assert.deepEqual(ui.errors, []);
+    assert.deepEqual(reload.errors, []);
+});
+
+test('failed loop saves restore the checkbox and show an actionable error', async t => {
+    const h = await setup(t);
+    const ui = frontend(h, 'main.js', h.cookie);
+    await ui.ready;
+    await ui.run('loadMode()');
+    const original = ui.context.fetch;
+    ui.context.fetch = (url, options = {}) => options.method === 'POST' && url === '/api/mode/alice'
+        ? Promise.resolve(new Response(JSON.stringify({ error: 'Unavailable' }), { status: 503 }))
+        : original(url, options);
+    const loop = ui.elements.get('mylist-loop-toggle');
+    loop.checked = true;
+    await loop.fire('change');
+    assert.equal(loop.checked, false);
+    assert.equal(loop.disabled, false);
+    assert.match(ui.elements.get('mylist-playback-status').textContent, /Please try again/);
+});
+
+test('overlay ended events restart a one-song loop without replaying it on ordinary polls', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    await h.api('/api/mode/alice', 'POST', { mylistLoop: true });
+    const ui = frontend(h, 'overlay.js');
+    await ui.ready;
+    assert.deepEqual(ui.plays, ['/api/yt-audio/AAAAAAAAAAA']);
+    await ui.run('fetchAndPlay()');
+    assert.equal(ui.plays.length, 1);
+    const firstId = ui.run('currentItemId');
+    ui.audios[0].handlers.get('ended')();
+    ui.audios[0].handlers.get('ended')(); // duplicate native event while advancing
+    await until(() => ui.plays.length === 2);
+    assert.notEqual(ui.run('currentItemId'), firstId);
+    assert.deepEqual(ui.plays, ['/api/yt-audio/AAAAAAAAAAA', '/api/yt-audio/AAAAAAAAAAA']);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
+    assert.deepEqual(ui.errors, []);
+});
+
+test('overlay ignores a stale current response arriving after advancement', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    await h.api('/api/mode/alice', 'POST', { mylistLoop: true });
+    const ui = frontend(h, 'overlay.js');
+    await ui.ready;
+    const original = ui.context.fetch;
+    let release;
+    let held = false;
+    let holdNext = true;
+    ui.context.fetch = async (url, options) => {
+        const res = await original(url, options);
+        if (holdNext && url.endsWith('/current')) {
+            holdNext = false;
+            held = true;
+            await new Promise(resolve => { release = resolve; });
+        }
+        return res;
+    };
+    const stale = ui.run('fetchAndPlay()');
+    await until(() => held);
+    await ui.run('advance()');
+    await until(() => ui.plays.length === 2);
+    const newId = ui.run('currentItemId');
+    release();
+    await stale;
+    assert.equal(ui.run('currentItemId'), newId);
+    assert.equal(ui.plays.length, 2);
+    assert.deepEqual(ui.errors, []);
+});

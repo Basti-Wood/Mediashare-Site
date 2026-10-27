@@ -6,6 +6,7 @@ const session  = require('express-session');
 const http     = require('http');
 const path     = require('path');
 const fs       = require('fs');
+const { randomUUID } = require('crypto');
 const { execFile, spawn } = require('child_process');
 const multer   = require('multer');
 const WebSocket = require('ws');
@@ -186,7 +187,10 @@ async function bastiPost(path) {
         method:  'POST',
         headers: { 'x-api-key': process.env.BASTIAPI_KEY || '' }
     });
-    return r.json();
+    const data = await r.json();
+    if (!r.ok || data?.success === false || data?.error)
+        throw new Error(data?.error || `Basti request failed (${r.status})`);
+    return data;
 }
 
 // Owner songs are marked by setting the username to US + channel name
@@ -259,10 +263,11 @@ function hasAccess(user, channel, accounts = loadAccounts()) {
 
 // ── Personal list + play-mode (in-memory, per channel) ───────────────────────────
 
-// mylistByChannel: channel -> string[] items
+// mylistByChannel: channel -> media items in upcoming playback order
 const mylistByChannel = new Map();
-// modeByChannel:   channel -> { mode: 'requests'|'mylist'|'switch', switchTurn: 'requests'|'mylist' }
+// Loop applies only to My List; viewer requests are always consumed once.
 const modeByChannel   = new Map();
+const promotedMyListByChannel = new Map();
 
 function getMyList(channel) {
     if (!mylistByChannel.has(channel)) mylistByChannel.set(channel, []);
@@ -270,7 +275,9 @@ function getMyList(channel) {
 }
 
 function getMode(channel) {
-    if (!modeByChannel.has(channel)) modeByChannel.set(channel, { mode: 'requests', switchTurn: 'requests' });
+    if (!modeByChannel.has(channel)) modeByChannel.set(channel, {
+        mode: 'requests', switchTurn: 'requests', mylistLoop: false
+    });
     return modeByChannel.get(channel);
 }
 
@@ -283,6 +290,39 @@ function clearChannelMyList(channel) { getMyList(channel).length = 0; }
 
 function loadChannelMode(channel) { return getMode(channel); }
 function saveChannelMode(channel, data) { modeByChannel.set(channel, data); }
+
+// Preview, pop-out and OBS may all poll/finish at once. Serialize playback
+// changes so a looping item is promoted once and a finish removes only one song.
+const playbackLocks = new Map();
+const playbackByChannel = new Map();
+
+async function withPlaybackLock(channel, action) {
+    const previous = playbackLocks.get(channel) || Promise.resolve();
+    const pending = previous.catch(() => {}).then(action);
+    playbackLocks.set(channel, pending);
+    try {
+        return await pending;
+    } finally {
+        if (playbackLocks.get(channel) === pending) playbackLocks.delete(channel);
+    }
+}
+
+function playbackIdFor(channel, item) {
+    if (!item) {
+        playbackByChannel.delete(channel);
+        return null;
+    }
+    const signature = JSON.stringify([
+        item.id, item.url || item.media, item.song_name || item.title,
+        item.username, item.platform || item.Platform
+    ]);
+    let playback = playbackByChannel.get(channel);
+    if (!playback || playback.signature !== signature) {
+        playback = { signature, id: randomUUID() };
+        playbackByChannel.set(channel, playback);
+    }
+    return playback.id;
+}
 
 function parseYouTubeVideoId(url) {
     const s = String(url);
@@ -560,6 +600,10 @@ app.post('/api/media/:owner/remove/:index', requireAuth, async (req, res) => {
         return res.status(403).json({ error: 'Access denied.' });
     try {
         const data = await bastiPost(`/removemedia/${req.params.owner}/${req.params.index}`);
+        if (req.params.index === '0') {
+            playbackByChannel.delete(req.params.owner);
+            promotedMyListByChannel.delete(req.params.owner);
+        }
         io.to(`ch:${req.params.owner}`).emit('queue:update', { channel: req.params.owner });
         res.json(data);
     } catch {
@@ -686,6 +730,22 @@ app.delete('/api/mylist/:owner', requireAuth, (req, res) => {
     res.json({ success: true });
 });
 
+app.post('/api/mylist/:owner/shuffle', requireAuth, (req, res) => {
+    const channel = req.params.owner;
+    if (!hasAccess(req.session.user, channel))
+        return res.status(403).json({ error: 'Access denied.' });
+
+    const data = loadChannelMyList(channel);
+    // Fisher-Yates gives every ordering the same chance and keeps duplicates.
+    for (let i = data.items.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [data.items[i], data.items[j]] = [data.items[j], data.items[i]];
+    }
+    saveChannelMyList(channel, data);
+    io.to(`ch:${channel}`).emit('queue:update', { channel });
+    res.json({ success: true, items: data.items });
+});
+
 // ── Mode API ──────────────────────────────────────────────────────────────────
 
 app.get('/api/mode/:channel', requireAuth, (req, res) => {
@@ -697,51 +757,60 @@ app.get('/api/mode/:channel', requireAuth, (req, res) => {
 app.post('/api/mode/:channel', requireAuth, (req, res) => {
     if (!hasAccess(req.session.user, req.params.channel))
         return res.status(403).json({ error: 'Access denied.' });
-    const { mode } = req.body;
+    const { mode, mylistLoop } = req.body;
     const valid = ['requests', 'mylist', 'switch'];
-    if (!valid.includes(mode))
+    if (mode !== undefined && !valid.includes(mode))
         return res.status(400).json({ error: 'Invalid mode.' });
+    if (mylistLoop !== undefined && typeof mylistLoop !== 'boolean')
+        return res.status(400).json({ error: 'mylistLoop must be a boolean.' });
+    if (mode === undefined && mylistLoop === undefined)
+        return res.status(400).json({ error: 'A mode or mylistLoop setting is required.' });
     const data = loadChannelMode(req.params.channel);
-    data.mode = mode;
-    if (mode === 'switch') data.switchTurn = 'requests';
+    if (mode !== undefined) {
+        data.mode = mode;
+        if (mode === 'switch') data.switchTurn = 'requests';
+    }
+    if (mylistLoop !== undefined && mylistLoop !== data.mylistLoop) {
+        data.mylistLoop = mylistLoop;
+        // Toggling during a song also applies to that song. Retain it when
+        // enabling loop, and avoid one extra replay when disabling loop.
+        const playing = promotedMyListByChannel.get(req.params.channel);
+        const list = getMyList(req.params.channel);
+        const index = playing ? list.indexOf(playing) : -1;
+        if (mylistLoop && playing && index === -1) list.push(playing);
+        if (!mylistLoop && index !== -1) list.splice(index, 1);
+    }
     saveChannelMode(req.params.channel, data);
     io.to(`ch:${req.params.channel}`).emit('queue:update', { channel: req.params.channel });
-    res.json({ success: true, mode });
+    res.json({ success: true, ...data });
 });
 
-// Tracks whether we've already pushed the head My List song to Basti for a
-// channel, so /current (which may be polled rapidly) doesn't push duplicates.
-const ownerPushInFlight = new Set();
-
-// Move the head My List item into the FRONT of the Basti queue, then drop it
-// from My List. Returns true if something was pushed.
+// Promote once under the channel playback lock. Looping rotates the item to
+// the tail, so the displayed list always shows the upcoming playback order.
 async function promoteMyListHeadToBasti(ch) {
     const listData = loadChannelMyList(ch);
     if (listData.items.length === 0) return false;
-    if (ownerPushInFlight.has(ch)) return false;
-
-    ownerPushInFlight.add(ch);
-    // Remove it from My List FIRST so the song is consumed exactly once. If we
-    // waited until after the Basti POST, a slow/failed call (bastiPost never
-    // throws on an HTTP error, only on a network fault) could leave the item in
-    // the list and replay it on the next poll. Snapshot it so we can restore it
-    // only if the network call genuinely fails.
-    const [head] = listData.items.splice(0, 1);
-    saveChannelMyList(ch, listData);
+    const head = listData.items[0];
 
     try {
         await pushOwnerSongToBasti(ch, head);
+        promotedMyListByChannel.set(ch, head);
+        // A user may remove, clear or shuffle the list during the upstream
+        // request. Find this exact entry again; never restore a deleted song.
+        const current = loadChannelMyList(ch);
+        const index = current.items.indexOf(head);
+        if (index !== -1) {
+            current.items.splice(index, 1);
+            if (loadChannelMode(ch).mylistLoop) current.items.push(head);
+            saveChannelMyList(ch, current);
+        }
+        playbackByChannel.delete(ch);
         io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
         return true;
     } catch (e) {
         console.error(`Failed to push owner song to Basti for ${ch}:`, e.message || e);
-        // Network failure — put it back at the front so it isn't lost.
-        const current = loadChannelMyList(ch);
-        current.items.unshift(head);
-        saveChannelMyList(ch, current);
+        // Keep the list unchanged when promotion fails.
         return false;
-    } finally {
-        ownerPushInFlight.delete(ch);
     }
 }
 
@@ -884,52 +953,57 @@ function streamNormalizedAudio(sourceUrl, res, label) {
 // head My List item to Basti, then always read the current item from Basti.
 app.get('/api/channels/:ch/current', async (req, res) => {
     const ch = req.params.ch;
-    const modeData = loadChannelMode(ch);
-    const { mode } = modeData;
-    const effectiveSource = mode === 'switch' ? modeData.switchTurn : mode;
+    return withPlaybackLock(ch, async () => {
+        const modeData = loadChannelMode(ch);
+        const { mode } = modeData;
+        const effectiveSource = mode === 'switch' ? modeData.switchTurn : mode;
 
-    try {
-        let media = [];
         try {
-            const data = await bastiGet(`/getallmedia/${ch}`);
-            media = Array.isArray(data.media) ? data.media : [];
-        } catch {
-            return res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
-        }
-
-        const topIsOwner = isOwnerSong(media[0], ch);
-
-        // Viewer-request songs available right now = anything in the Basti queue
-        // that isn't an owner (My List) song.
-        const hasViewerSong = media.some(item => !isOwnerSong(item, ch));
-        const hasMyListSong = loadChannelMyList(ch).items.length > 0;
-
-        // Decide whether to promote a My List song into Basti's front row now:
-        //  - 'mylist' mode : always prefer My List.
-        //  - 'switch' mode : when it's My List's turn (effectiveSource === 'mylist').
-        //  - ANY mode      : automatic fallback — if there's no viewer song to
-        //                    play but a personal-list song exists, promote it so
-        //                    the overlay never dead-ends on an empty viewer list.
-        const wantMyList =
-            !topIsOwner && hasMyListSong &&
-            (effectiveSource === 'mylist' || !hasViewerSong);
-
-        if (wantMyList) {
-            const pushed = await promoteMyListHeadToBasti(ch);
-            if (pushed) {
+            let media = [];
+            try {
                 const data = await bastiGet(`/getallmedia/${ch}`);
                 media = Array.isArray(data.media) ? data.media : [];
+            } catch {
+                return res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
             }
-        }
 
-        const current = media[0]
-            ? { ...media[0], _source: isOwnerSong(media[0], ch) ? 'mylist' : 'requests' }
-            : null;
-        res.json({ current });
-    } catch (e) {
-        console.error('current failed:', e.message || e);
-        res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
-    }
+            const topIsOwner = isOwnerSong(media[0], ch);
+            if (!topIsOwner) promotedMyListByChannel.delete(ch);
+
+            // Viewer-request songs available right now = anything in the Basti queue
+            // that isn't an owner (My List) song.
+            const hasViewerSong = media.some(item => !isOwnerSong(item, ch));
+            const hasMyListSong = loadChannelMyList(ch).items.length > 0;
+
+            // Decide whether to promote a My List song into Basti's front row now:
+            //  - 'mylist' mode : always prefer My List.
+            //  - 'switch' mode : when it's My List's turn (effectiveSource === 'mylist').
+            //  - ANY mode      : automatic fallback — if there's no viewer song to
+            //                    play but a personal-list song exists, promote it so
+            //                    the overlay never dead-ends on an empty viewer list.
+            const wantMyList =
+                !topIsOwner && hasMyListSong &&
+                (effectiveSource === 'mylist' || !hasViewerSong);
+
+            if (wantMyList) {
+                const pushed = await promoteMyListHeadToBasti(ch);
+                if (pushed) {
+                    const data = await bastiGet(`/getallmedia/${ch}`);
+                    media = Array.isArray(data.media) ? data.media : [];
+                }
+            }
+
+            const current = media[0]
+                ? { ...media[0], _source: isOwnerSong(media[0], ch) ? 'mylist' : 'requests' }
+                : null;
+            const playbackId = playbackIdFor(ch, current);
+            if (current) current._playbackId = playbackId;
+            res.json({ current });
+        } catch (e) {
+            console.error('current failed:', e.message || e);
+            res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
+        }
+    });
 });
 
 // Advance the queue (video ended in overlay).
@@ -938,20 +1012,28 @@ app.get('/api/channels/:ch/current', async (req, res) => {
 // next so the following /current call promotes a My List song (or not).
 app.post('/api/channels/:ch/next', async (req, res) => {
     const ch = req.params.ch;
-    const modeData = loadChannelMode(ch);
-    const { mode } = modeData;
+    return withPlaybackLock(ch, async () => {
+        const modeData = loadChannelMode(ch);
+        const { mode } = modeData;
 
-    try {
-        await bastiPost(`/removemedia/${ch}/0`);
-        if (mode === 'switch') {
-            modeData.switchTurn = modeData.switchTurn === 'mylist' ? 'requests' : 'mylist';
-            saveChannelMode(ch, modeData);
+        try {
+            // Multiple overlays can report the same finish. Old reports must not
+            // remove a newly promoted item (especially a one-song loop).
+            if (req.body.playbackId && req.body.playbackId !== playbackByChannel.get(ch)?.id)
+                return res.json({ success: true, advanced: false });
+            await bastiPost(`/removemedia/${ch}/0`);
+            playbackByChannel.delete(ch);
+            promotedMyListByChannel.delete(ch);
+            if (mode === 'switch') {
+                modeData.switchTurn = modeData.switchTurn === 'mylist' ? 'requests' : 'mylist';
+                saveChannelMode(ch, modeData);
+            }
+            io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
+            res.json({ success: true });
+        } catch {
+            res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
         }
-        io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
-        res.json({ success: true });
-    } catch {
-        res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
-    }
+    });
 });
 
 // ── Webhook (api.bastiwood.com pushes new media to us) ───────────────────────
@@ -1253,6 +1335,8 @@ async function playLocalFileNow(req, res) {
 
         // Push the local song to the front of Basti.
         await pushOwnerSongToBasti(ch, entry);
+        playbackByChannel.delete(ch);
+        promotedMyListByChannel.delete(ch);
 
         io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
         res.json({ success: true, url: mediaUrl });
