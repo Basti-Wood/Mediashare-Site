@@ -42,6 +42,11 @@ const mylistCount     = document.getElementById('mylist-count');
 const mylistEmpty     = document.getElementById('mylist-empty');
 const mylistTable     = document.getElementById('mylist-table');
 const mylistTbody     = document.getElementById('mylist-tbody');
+const mylistLoopToggle = document.getElementById('mylist-loop-toggle');
+const mylistShuffleBtn = document.getElementById('mylist-shuffle-btn');
+const mylistPlaybackStatus = document.getElementById('mylist-playback-status');
+let savingMode = false;
+let shufflingMyList = false;
 
 // Mode selector
 const modeSelect      = document.getElementById('mode-select');
@@ -106,27 +111,59 @@ function renderTitle(item) {
 // ── Play mode ────────────────────────────────────────────────────────────────────
 
 async function loadMode() {
-    if (!currentChannel) return;
+    const channel = currentChannel;
+    if (!channel || savingMode) return;
     try {
-        const res  = await fetch(`/api/mode/${encodeURIComponent(currentChannel)}`);
-        if (!res.ok) return;
+        const res  = await fetch(`/api/mode/${encodeURIComponent(channel)}`);
+        if (!res.ok) throw new Error(res.status);
         const data = await res.json();
+        if (channel !== currentChannel || savingMode) return;
         modeSelect.value = data.mode || 'requests';
-    } catch {}
+        mylistLoopToggle.checked = data.mylistLoop === true;
+        mylistLoopToggle.disabled = false;
+    } catch (e) {
+        if (channel === currentChannel) setMyListPlaybackStatus('Could not load playback settings.', true);
+    }
 }
 
-modeSelect.addEventListener('change', async () => {
-    if (!currentChannel) return;
+function setMyListPlaybackStatus(message, error = false) {
+    mylistPlaybackStatus.textContent = message;
+    mylistPlaybackStatus.className = `is-size-7 mb-3 ${error ? 'has-text-danger' : 'has-text-success'}`;
+}
+
+async function saveMode(update) {
+    const channel = currentChannel;
+    if (!channel || savingMode) return;
+    savingMode = true;
+    modeSelect.disabled = true;
+    mylistLoopToggle.disabled = true;
     try {
-        await fetch(`/api/mode/${encodeURIComponent(currentChannel)}`, {
+        const res = await fetch(`/api/mode/${encodeURIComponent(channel)}`, {
             method:  'POST',
             headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({ mode: modeSelect.value })
+            body:    JSON.stringify(update)
         });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not save playback settings.');
+        if (channel !== currentChannel) return;
+        modeSelect.value = data.mode;
+        mylistLoopToggle.checked = data.mylistLoop === true;
+        setMyListPlaybackStatus(update.mylistLoop === undefined
+            ? 'Play mode updated.'
+            : `Loop ${data.mylistLoop ? 'on' : 'off'}.`);
+        if (activeQueueTab === 'mylist') await loadMyList();
     } catch (e) {
         console.error('Failed to set mode', e);
+        if (channel === currentChannel) setMyListPlaybackStatus('Could not save playback settings. Please try again.', true);
+    } finally {
+        savingMode = false;
+        modeSelect.disabled = false;
+        await loadMode();
     }
-});
+}
+
+modeSelect.addEventListener('change', () => saveMode({ mode: modeSelect.value }));
+mylistLoopToggle.addEventListener('change', () => saveMode({ mylistLoop: mylistLoopToggle.checked }));
 
 // ── My List helpers ──────────────────────────────────────────────────────────
 
@@ -152,6 +189,7 @@ function mylistPlatformTag(platform) {
 
 function renderMyList(items) {
     mylistCount.textContent = items.length;
+    mylistShuffleBtn.disabled = shufflingMyList || items.length < 2;
     if (items.length === 0) {
         mylistEmpty.style.display = '';
         mylistTable.style.display = 'none';
@@ -179,14 +217,37 @@ function renderMyList(items) {
 // ── My List API ───────────────────────────────────────────────────────────────
 
 async function loadMyList() {
-    if (!currentChannel) return;
+    const channel = currentChannel;
+    if (!channel) return;
     try {
-        const res  = await fetch(`/api/mylist/${encodeURIComponent(currentChannel)}`);
+        const res  = await fetch(`/api/mylist/${encodeURIComponent(channel)}`);
         if (!res.ok) throw new Error(res.status);
         const data = await res.json();
+        if (channel !== currentChannel) return;
         renderMyList(Array.isArray(data.items) ? data.items : []);
     } catch (e) {
         console.error('Failed to load my list', e);
+    }
+}
+
+async function shuffleMyList() {
+    const channel = currentChannel;
+    if (!channel || shufflingMyList) return;
+    shufflingMyList = true;
+    mylistShuffleBtn.disabled = true;
+    try {
+        const res = await fetch(`/api/mylist/${encodeURIComponent(channel)}/shuffle`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not shuffle My List.');
+        if (channel !== currentChannel) return;
+        renderMyList(data.items);
+        setMyListPlaybackStatus('My List shuffled.');
+    } catch (e) {
+        console.error('Failed to shuffle my list', e);
+        if (channel === currentChannel) setMyListPlaybackStatus('Could not shuffle My List. Please try again.', true);
+    } finally {
+        shufflingMyList = false;
+        await loadMyList();
     }
 }
 
@@ -268,6 +329,7 @@ function setupQueueTypeTabs() {
         if (e.key === 'Enter') addToMyList(mylistUrlInput.value);
     });
     mylistClearBtn.addEventListener('click', () => clearMyList());
+    mylistShuffleBtn.addEventListener('click', shuffleMyList);
 
     // Local-files event wiring
     localFolderCreateBtn.addEventListener('click', createLocalFolder);
@@ -582,6 +644,10 @@ function switchChannel(channel) {
     if (socket && currentChannel) socket.emit('leave:channel', currentChannel);
 
     currentChannel = channel;
+    mylistLoopToggle.checked = false;
+    mylistLoopToggle.disabled = true;
+    mylistShuffleBtn.disabled = true;
+    setMyListPlaybackStatus('');
 
     tabList.querySelectorAll('li').forEach(li =>
         li.classList.toggle('is-active', li.dataset.channel === channel));
@@ -684,9 +750,9 @@ async function init() {
     socket.on('queue:update', ({ channel }) => {
         if (channel !== currentChannel) return;
         loadMedia();
-        // A promoted My List song is consumed from the personal list server-side,
-        // so refresh that view too when it's open — otherwise the finished/started
-        // song lingers on screen until the user switches tabs.
+        loadMode();
+        // Promotion consumes or rotates My List, so keep its displayed order
+        // and the loop setting in sync across dashboards.
         if (activeQueueTab === 'mylist') loadMyList();
     });
 

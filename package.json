@@ -4,6 +4,7 @@
   "description": "Mediashare website with multi-channel support and webhook integration",
   "main": "scrs/backend/server.js",
   "scripts": {
+    "test": "node --test tests/*.test.js",
     "start": "node scrs/backend/server.js",
     "dev": "nodemon scrs/backend/server.js"
   },

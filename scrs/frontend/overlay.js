@@ -38,6 +38,7 @@ let currentItemId  = null;
 let skipItemId     = null;   // ID of last removed item — skip if it comes back
 let finishedItemId = null;   // ID of last *finished/empty* item — never replay it
 let ytFallbackTimer = null;
+let currentFetchSequence = 0;
 
 // ── Background-throttle survival ──────────────────────────────────────────────
 // The native <audio> element keeps playing in a background tab on its own, and a
@@ -343,19 +344,30 @@ async function advance() {
     if (!CHANNEL) return;
     if (advancing) return;           // already advancing (event + watchdog race)
     advancing      = true;
+    const playbackId = currentItemId;
+    currentFetchSequence++;         // ignore any current response started before this finish
     skipItemId     = currentItemId;  // remember removed item so we don't replay it
     finishedItemId = currentItemId;  // and never auto-replay the finished item
     currentItemId  = null;
     showIdle();                      // blank the screen immediately
     try {
-        await fetch(`/api/channels/${encodeURIComponent(CHANNEL)}/next`, { method: 'POST' });
+        const res = await fetch(`/api/channels/${encodeURIComponent(CHANNEL)}/next`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ playbackId })
+        });
+        if (!res.ok) throw new Error(res.status);
         // The server emits queue:update after this POST, which triggers fetchAndPlay().
         // fetchAndPlay → playItem will handle the next item (or stay idle if queue empty).
     } catch (e) {
         console.error('Failed to advance queue', e);
         skipItemId = null;
+        finishedItemId = null;
     } finally {
         advancing = false;
+        // A queue:update can arrive during the POST. Always fetch once more
+        // afterward so a one-song loop starts its next playback immediately.
+        fetchAndPlay();
     }
 }
 
@@ -580,7 +592,7 @@ function playItem(item) {
     // api.bastiwood.com uses capital-P Platform and .media for the URL
     const url      = item.url || item.media || '';
     const platform = (item.platform || item.Platform || '').toLowerCase();
-    const id       = item.id || `${platform}|${url}|${item.song_name || ''}|${item.username || ''}`;
+    const id       = item._playbackId || item.id || `${platform}|${url}|${item.song_name || ''}|${item.username || ''}`;
 
     if (id === currentItemId) return;   // already playing this
     if (id === skipItemId) { showIdle(); return; }  // just removed — API hasn't updated yet
@@ -636,14 +648,19 @@ window.onYouTubeIframeAPIReady = function () {
 
 async function fetchAndPlay() {
     if (!CHANNEL) { showIdle(); return; }
+    if (advancing) return;
+    const sequence = ++currentFetchSequence;
     try {
         const res  = await fetch(`/api/channels/${encodeURIComponent(CHANNEL)}/current`);
+        if (!res.ok) throw new Error(res.status);
         const data = await res.json();
+        if (sequence !== currentFetchSequence || advancing) return;
         // If the queue is genuinely empty, forget the finished marker so the
         // *next* freshly-added song (even if identical) plays normally.
         if (!data.current) finishedItemId = null;
         playItem(data.current);
     } catch (e) {
+        if (sequence !== currentFetchSequence || advancing) return;
         console.error('Failed to fetch current item', e);
         showIdle();
     }

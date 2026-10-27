@@ -155,6 +155,24 @@
                     </div>
                     <p id="mylist-add-status" class="is-size-7 mb-3"></p>
 
+                    <div class="field is-grouped is-grouped-multiline is-align-items-center mb-2">
+                        <div class="control">
+                            <label class="checkbox">
+                                <input id="mylist-loop-toggle" type="checkbox" disabled>
+                                Loop My List
+                            </label>
+                        </div>
+                        <div class="control">
+                            <button id="mylist-shuffle-btn" class="button is-small is-info" disabled>
+                                Shuffle My List
+                            </button>
+                        </div>
+                    </div>
+                    <p class="is-size-7 has-text-grey mb-1">
+                        Loop repeats your songs. Shuffle randomizes the list without interrupting the current song.
+                    </p>
+                    <p id="mylist-playback-status" class="is-size-7 mb-3" role="status" aria-live="polite"></p>
+
                     <div class="level mb-2">
                         <div class="level-left">
                             <p class="heading level-item">
@@ -257,6 +275,6 @@
 
     <!-- Socket.io client -->
     <script src="/socket.io/socket.io.js"></script>
-    <script src="../scrs/frontend/main.js?v=bg-1"></script>
+    <script src="../scrs/frontend/main.js?v=mylist-loop-shuffle-1"></script>
 </body>
 </html>
