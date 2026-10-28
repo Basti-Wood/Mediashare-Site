@@ -155,13 +155,35 @@
             font-family: 'Segoe UI', sans-serif;
             font-size: 1.2rem;
         }
+
+        #playback-status {
+            position: absolute;
+            top: 12px; left: 12px; right: 12px;
+            z-index: 30;
+            padding: 10px 12px;
+            border: 1px solid #666;
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.88);
+            color: #fff;
+            font: 0.85rem 'Segoe UI', sans-serif;
+        }
+        #playback-status[hidden] { display: none; }
+        #playback-status button { margin: 8px 6px 0 0; padding: 5px 10px; cursor: pointer; }
+        #pause-resume-btn {
+            padding: 5px 9px;
+            border: 1px solid #666;
+            border-radius: 4px;
+            background: #222;
+            color: #fff;
+            cursor: pointer;
+        }
     </style>
 </head>
 <body>
     <div id="player-container">
         <div id="idle-screen">Waiting for media…</div>
         <!-- YouTube player target -->
-        <div id="yt-player" style="display:none"></div>
+        <div id="yt-player" style="display:none"><div id="yt-player-mount"></div></div>
         <!-- Spotify embed target -->
         <iframe id="spotify-player"
                 style="display:none"
@@ -170,6 +192,12 @@
                 height="152">
         </iframe>
 
+        <div id="playback-status" role="status" aria-live="polite" hidden>
+            <div id="playback-message"></div>
+            <button id="playback-retry-btn" type="button">Play / Retry</button>
+            <button id="playback-skip-btn" type="button">Skip this song</button>
+        </div>
+
         <!-- Media controls (shown when ?controls=1) -->
         <div id="player-controls">
             <div class="ctrl-row">
@@ -177,6 +205,7 @@
                 <span id="time-display">0:00 / 0:00</span>
             </div>
             <div class="ctrl-row">
+                <button id="pause-resume-btn" type="button" aria-pressed="false">⏸ Pause</button>
                 <span class="ctrl-icon">&#128266;</span>
                 <input type="range" id="volume-bar" min="0" max="100" value="100" step="0.1" aria-label="Volume">
                 <label class="volume-value">
@@ -191,6 +220,6 @@
     <script src="/socket.io/socket.io.js"></script>
     <!-- YouTube IFrame API -->
     <script src="https://www.youtube.com/iframe_api"></script>
-    <script src="../scrs/frontend/overlay.js?v=mylist-loop-shuffle-1"></script>
+    <script src="../scrs/frontend/overlay.js?v=audio-settings-4"></script>
 </body>
 </html>

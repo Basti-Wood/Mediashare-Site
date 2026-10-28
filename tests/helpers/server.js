@@ -12,6 +12,7 @@ const serverFile = path.resolve(__dirname, '../../scrs/backend/server.js');
 const serverRequire = createRequire(serverFile);
 
 async function createTestServer(options = {}) {
+    const localRoot = fs.mkdtempSync(path.resolve(__dirname, '../.tmp-media-'));
     const queues = new Map();
     const calls = [];
     const events = [];
@@ -25,12 +26,17 @@ async function createTestServer(options = {}) {
 
     const sandbox = {
         __dirname: path.dirname(serverFile),
-        process: { env: { SESSION_SECRET: 'test-only', BASTI_POLLING_ONLY: 'true' } },
+        process: { env: { SESSION_SECRET: 'test-only', BASTI_POLLING_ONLY: 'true', LOCAL_MEDIA_ROOT: localRoot,
+            AUDIO_SETTINGS_ROOT: path.join(localRoot, '.audio-settings') } },
         console: { log() {}, warn() {}, error() {} },
         Buffer, URL, URLSearchParams, setTimeout, clearTimeout, setInterval, clearInterval,
         Math: Object.assign(Object.create(Math), { random: options.random || Math.random }),
         require(name) {
             if (name === 'dotenv') return { config() {} };
+            if (name === 'child_process' && (options.spawn || options.execFile))
+                return { ...serverRequire(name),
+                    ...(options.spawn ? { spawn: options.spawn } : {}),
+                    ...(options.execFile ? { execFile: options.execFile } : {}) };
             if (name === 'fs') return {
                 ...fs,
                 readFileSync(file, ...args) {
@@ -85,7 +91,8 @@ async function createTestServer(options = {}) {
             return { ok: true, json: async () => ({ success: true }) };
         }
     };
-    vm.runInNewContext(fs.readFileSync(serverFile, 'utf8'), sandbox, { filename: serverFile });
+    const { playlistImporter } = vm.runInNewContext(
+        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter });', sandbox, { filename: serverFile });
     server.listen = listen;
     await new Promise(resolve => listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
@@ -105,12 +112,19 @@ async function createTestServer(options = {}) {
     }
 
     return {
-        base, calls, events, queues, request, login,
+        base, calls, events, queues, request, login, localRoot,
+        settleImport(channel = 'alice') { return playlistImporter.settle(channel); },
         failPromotion(kind) { failPromotion = kind; },
         beforePromotion(action) { beforePromotion = action; },
         async close() {
+            for (const channel of ['alice', 'bob']) {
+                const job = playlistImporter.status(channel);
+                if (job?.status === 'running') playlistImporter.cancel(channel, job.id);
+                await playlistImporter.settle(channel);
+            }
             server.closeAllConnections();
             await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+            fs.rmSync(localRoot, { recursive: true, force: true });
         }
     };
 }

@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mediashare — Dashboard</title>
     <link rel="stylesheet" href="../styles/bulma/css/bulma.min.css">
-    <link rel="stylesheet" href="../styles/mystyles.css?v=fix-6">
+    <link rel="stylesheet" href="../styles/mystyles.css?v=audio-settings-4">
 </head>
-<body class="dashboard-body" data-build="fix-6">
+<body class="dashboard-body" data-build="audio-settings-4">
 
     <!-- ── Navbar ──────────────────────────────────────────────────────────── -->
     <nav class="navbar is-dark" role="navigation">
@@ -78,6 +78,8 @@
                 <div id="now-playing-info" class="mb-2">
                     <span class="has-text-grey">Nothing playing.</span>
                 </div>
+                <button id="pause-current-btn" class="button is-info is-fullwidth mb-2" type="button"
+                        aria-pressed="false" disabled>⏸ Pause</button>
                 <button id="skip-current-btn" class="button is-warning is-fullwidth mb-4">
                     ⏭ Skip current song
                 </button>
@@ -100,6 +102,25 @@
                             </div>
                         </div>
                     </div>
+                </div>
+
+                <!-- Personal playback controls stay visible on every tab. -->
+                <div id="mylist-playback-controls" class="mb-3">
+                    <div class="buttons are-small mb-1">
+                        <button id="mylist-loop-btn" class="button is-small is-dark" type="button"
+                                aria-pressed="false" aria-describedby="mylist-playback-help" disabled>
+                            ↻ Loop My List: Off
+                        </button>
+                        <button id="mylist-shuffle-btn" class="button is-small is-info" type="button"
+                                aria-describedby="mylist-playback-help" disabled>
+                            ⇄ Shuffle My List
+                        </button>
+                    </div>
+                    <p id="mylist-playback-help" class="is-size-7 has-text-grey mb-1">
+                        Repeat or shuffle your songs, including MP3s added to My List.
+                        Shuffle keeps the current song playing.
+                    </p>
+                    <p id="mylist-playback-status" class="is-size-7 mb-0" role="status" aria-live="polite"></p>
                 </div>
 
                 <!-- Queue-type tab switcher -->
@@ -154,24 +175,6 @@
                         </div>
                     </div>
                     <p id="mylist-add-status" class="is-size-7 mb-3"></p>
-
-                    <div class="field is-grouped is-grouped-multiline is-align-items-center mb-2">
-                        <div class="control">
-                            <label class="checkbox">
-                                <input id="mylist-loop-toggle" type="checkbox" disabled>
-                                Loop My List
-                            </label>
-                        </div>
-                        <div class="control">
-                            <button id="mylist-shuffle-btn" class="button is-small is-info" disabled>
-                                Shuffle My List
-                            </button>
-                        </div>
-                    </div>
-                    <p class="is-size-7 has-text-grey mb-1">
-                        Loop repeats your songs. Shuffle randomizes the list without interrupting the current song.
-                    </p>
-                    <p id="mylist-playback-status" class="is-size-7 mb-3" role="status" aria-live="polite"></p>
 
                     <div class="level mb-2">
                         <div class="level-left">
@@ -234,6 +237,27 @@
                     </div>
                     <p id="local-upload-status" class="is-size-7 mb-3"></p>
 
+                    <!-- YouTube playlists are saved alongside uploaded MP3s. -->
+                    <div class="local-playlist-import mb-4">
+                        <label class="label is-small" for="local-playlist-url">Save a YouTube playlist as MP3s</label>
+                        <input id="local-playlist-url" class="input is-small mb-2" type="url"
+                               placeholder="https://www.youtube.com/playlist?list=…">
+                        <div class="buttons are-small mb-1">
+                            <button id="local-playlist-import-btn" class="button is-small is-link" type="button">
+                                ↓ Save playlist as MP3s
+                            </button>
+                            <button id="local-playlist-cancel-btn" class="button is-small is-danger is-outlined"
+                                    type="button" hidden>Cancel download</button>
+                        </div>
+                        <p class="is-size-7 has-text-grey mb-2">
+                            Saves to the selected folder, or creates a playlist folder when none is selected.
+                            Completed songs remain available if a download is cancelled.
+                        </p>
+                        <progress id="local-playlist-progress" class="progress is-small is-link mb-2"
+                                  max="100" value="0" hidden aria-label="Playlist download progress"></progress>
+                        <p id="local-playlist-status" class="is-size-7 mb-0" role="status" aria-live="polite"></p>
+                    </div>
+
                     <!-- Folder list -->
                     <div class="level mb-2">
                         <div class="level-left">
@@ -248,6 +272,11 @@
                             <p class="heading level-item">
                                 Files&nbsp;<span id="local-file-count" class="tag is-dark">0</span>
                             </p>
+                        </div>
+                        <div class="level-right">
+                            <button id="local-queue-folder-btn" class="button is-small is-info" type="button" disabled>
+                                + Add these files to My List
+                            </button>
                         </div>
                     </div>
 
@@ -275,6 +304,6 @@
 
     <!-- Socket.io client -->
     <script src="/socket.io/socket.io.js"></script>
-    <script src="../scrs/frontend/main.js?v=mylist-loop-shuffle-1"></script>
+    <script src="../scrs/frontend/main.js?v=audio-settings-4"></script>
 </body>
 </html>

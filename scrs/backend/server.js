@@ -11,10 +11,13 @@ const { execFile, spawn } = require('child_process');
 const multer   = require('multer');
 const WebSocket = require('ws');
 const { Server } = require('socket.io');
+const { createPlaylistImporter } = require('./playlist-imports');
+const { createAudioSettings } = require('./audio-settings');
 
 const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server);
+const audioSettings = createAudioSettings(process.env.AUDIO_SETTINGS_ROOT || path.join(__dirname, '../..', 'data', 'audio-settings'));
 
 const BASTI_BASE = 'https://api.bastiwood.com';
 const BASTI_WS_BASE = String(process.env.BASTI_WS_BASE || BASTI_BASE)
@@ -835,7 +838,8 @@ async function promoteMyListHeadToBasti(ch) {
 // The resolved googlevideo URL is signed and time-limited (a few hours), so we
 // cache it briefly to avoid spawning yt-dlp on every play.
 
-const ytAudioCache = new Map(); // videoId -> { url, expires }
+const ytAudioCache = new Map(); // videoId -> { source: { url, headers }, expires }
+const ytAudioPending = new Map();
 const YT_AUDIO_TTL_MS = 90 * 60 * 1000; // 90 min — comfortably inside the signed-URL lifetime
 
 // Target loudness for all normalised playback (YouTube proxy + local uploads).
@@ -843,33 +847,50 @@ const YT_AUDIO_TTL_MS = 90 * 60 * 1000; // 90 min — comfortably inside the sig
 // Music), so songs from different sources end up at a consistent volume.
 const LOUDNORM_FILTER = 'loudnorm=I=-14:TP=-1.5:LRA=11';
 
-function resolveYouTubeAudioUrl(videoId) {
-    return new Promise((resolve, reject) => {
-        // -f bestaudio: pick the best audio-only stream.
-        // -g: print the direct media URL instead of downloading.
-        // --no-playlist: a bare ID must never expand into a list.
+function resolveYouTubeAudioSource(videoId) {
+    if (ytAudioPending.has(videoId)) return ytAudioPending.get(videoId);
+    const pending = new Promise((resolve, reject) => {
+        // Modern YouTube extraction needs an enabled JS runtime. Keep yt-dlp's
+        // HTTP headers with the signed URL so ffmpeg uses the same request context.
         execFile(
             'yt-dlp',
             [
-                '-f', 'bestaudio',
-                '-g',
+                '--ignore-config',
+                '--js-runtimes', 'node',
+                '-f', 'bestaudio/best',
+                '--dump-single-json',
+                '--skip-download',
                 '--no-playlist',
                 '--no-warnings',
+                '--',
                 `https://www.youtube.com/watch?v=${videoId}`
             ],
-            { timeout: 20000, maxBuffer: 1024 * 1024 },
+            { timeout: 45000, maxBuffer: 4 * 1024 * 1024 },
             (err, stdout, stderr) => {
                 if (err) {
-                    return reject(new Error(String(stderr || err.message).trim()));
+                    return reject(Object.assign(new Error(String(stderr || err.message).trim()), { code: err.code }));
                 }
-                const url = String(stdout).trim().split('\n')[0];
-                if (!url || !/^https?:\/\//.test(url)) {
-                    return reject(new Error('yt-dlp returned no usable URL'));
+                try {
+                    const data = JSON.parse(String(stdout));
+                    const selected = data.requested_downloads?.[0] || data;
+                    const url = selected.url || data.url;
+                    if (!url || !['https:', 'http:'].includes(new URL(url).protocol))
+                        throw new Error('yt-dlp returned no usable audio URL.');
+                    const headers = {};
+                    for (const [name, value] of Object.entries(selected.http_headers || data.http_headers || {})) {
+                        if (/^(user-agent|referer|origin|accept)$/i.test(name)
+                            && typeof value === 'string' && !/[\r\n]/.test(value)) headers[name] = value;
+                    }
+                    resolve({ url, headers });
+                } catch (err) {
+                    reject(new Error(`Could not read yt-dlp audio metadata: ${err.message}`));
                 }
-                resolve(url);
             }
         );
     });
+    ytAudioPending.set(videoId, pending);
+    pending.finally(() => ytAudioPending.delete(videoId)).catch(() => {});
+    return pending;
 }
 
 // GET a same-origin, loudness-normalised audio stream for a YouTube video id.
@@ -881,32 +902,37 @@ app.get('/api/yt-audio/:videoId', async (req, res) => {
         return res.status(400).json({ error: 'Invalid video id.' });
     }
 
-    let sourceUrl;
+    let source;
     const cached = ytAudioCache.get(videoId);
     if (cached && cached.expires > Date.now()) {
-        sourceUrl = cached.url;
+        source = cached.source;
     } else {
         try {
-            sourceUrl = await resolveYouTubeAudioUrl(videoId);
-            ytAudioCache.set(videoId, { url: sourceUrl, expires: Date.now() + YT_AUDIO_TTL_MS });
+            source = await resolveYouTubeAudioSource(videoId);
+            ytAudioCache.set(videoId, { source, expires: Date.now() + YT_AUDIO_TTL_MS });
         } catch (e) {
             console.error(`yt-dlp failed for ${videoId}:`, e.message || e);
-            return res.status(502).json({ error: 'Could not resolve audio stream.' });
+            return res.status(502).json({
+                error: e.code === 'ENOENT' ? 'yt-dlp is not installed on the server.' : 'Could not resolve YouTube audio.',
+                code: e.code === 'ENOENT' ? 'YTDLP_MISSING' : 'YOUTUBE_RESOLVE_FAILED'
+            });
         }
     }
 
-    streamNormalizedAudio(sourceUrl, res, videoId);
+    if (!res.destroyed) streamNormalizedAudio(source, res, videoId, () => ytAudioCache.delete(videoId));
 });
 
 // Transcodes a (possibly remote) audio source through ffmpeg with loudness
 // normalisation and streams the result to the client same-origin. `res` must
 // not have been responded to yet.
-function streamNormalizedAudio(sourceUrl, res, label) {
+function streamNormalizedAudio(source, res, label, onFailure = () => {}) {
+    const headers = Object.entries(source.headers || {}).map(([name, value]) => `${name}: ${value}\r\n`).join('');
     const ff = spawn('ffmpeg', [
         '-reconnect', '1',
         '-reconnect_streamed', '1',
         '-reconnect_delay_max', '5',
-        '-i', sourceUrl,
+        ...(headers ? ['-headers', headers] : []),
+        '-i', source.url,
         '-vn',
         '-af', LOUDNORM_FILTER,
         '-f', 'mp3',
@@ -920,21 +946,35 @@ function streamNormalizedAudio(sourceUrl, res, label) {
         stderrTail = (stderrTail + chunk.toString()).slice(-2000);
     });
 
-    res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Cache-Control', 'no-store');
 
-    ff.stdout.once('data', () => { sentData = true; });
-    ff.stdout.pipe(res);
+    ff.stdout.once('data', () => {
+        sentData = true;
+        res.setHeader('Content-Type', 'audio/mpeg');
+    });
+    // A failed/empty ffmpeg stdout must not end the response with a fake 200
+    // before its close event can send a useful JSON 502.
+    ff.stdout.pipe(res, { end: false });
 
     ff.on('error', err => {
         console.error(`ffmpeg failed to start for ${label}:`, err.message || err);
-        if (!res.headersSent) res.status(502).json({ error: 'Audio transcode failed.' });
+        onFailure();
+        if (!res.headersSent) res.status(502).json({ error: 'Audio transcode failed.', code: 'AUDIO_TRANSCODE_FAILED' });
+        else if (!res.writableEnded) res.destroy();
     });
 
     ff.on('close', code => {
-        if (code !== 0 && !sentData) {
+        if (res.destroyed) return;
+        if (code !== 0 && sentData) {
+            onFailure();
+            // Truncating a stream is a network failure, not a completed song.
+            res.destroy();
+            return;
+        }
+        if (!sentData) {
             console.error(`ffmpeg exited ${code} for ${label}:`, stderrTail.trim());
-            if (!res.headersSent) res.status(502).json({ error: 'Audio transcode failed.' });
+            onFailure();
+            if (!res.headersSent) res.status(502).json({ error: 'No playable audio was produced.', code: 'AUDIO_TRANSCODE_FAILED' });
         }
         if (!res.writableEnded) res.end();
     });
@@ -946,6 +986,23 @@ function streamNormalizedAudio(sourceUrl, res, label) {
 }
 
 // ── Overlay endpoints (no auth — used by OBS browser source) ─────────────────
+
+app.get('/api/channels/:ch/audio-settings', (req, res) => {
+    res.json({ settings: audioSettings.get(req.params.ch) });
+});
+
+app.post('/api/channels/:ch/audio-settings', requireAuth, (req, res) => {
+    const channel = req.params.ch;
+    if (!hasAccess(req.session.user, channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    try {
+        const settings = audioSettings.update(channel, req.body);
+        io.to(`ch:${channel}`).emit('audio:settings', { channel, settings });
+        res.json({ success: true, settings });
+    } catch (err) {
+        res.status(err.status || 500).json({ error: err.status ? err.message : 'Could not save audio settings.' });
+    }
+});
 
 // Get the current (first) item — respects play mode.
 // For 'mylist'/'switch' sources, owner songs are routed THROUGH the Basti queue
@@ -1050,7 +1107,71 @@ app.post('/api/webhook/:ch', (req, res) => {
 
 // ── Local media (MP3 upload, folder management, instant playback) ─────────────
 
-const LOCAL_MEDIA_ROOT = path.join(__dirname, '../..', 'data', 'local-media');
+const LOCAL_MEDIA_ROOT = process.env.LOCAL_MEDIA_ROOT || path.join(__dirname, '../..', 'data', 'local-media');
+const playlistImporter = createPlaylistImporter({
+    root: LOCAL_MEDIA_ROOT,
+    spawn,
+    normalizeFile: normalizeAudioFile,
+    onChange: (channel, job) => io.to(`ch:${channel}`).emit('local:import:update', { channel, job })
+});
+
+app.post('/api/local/:channel/playlist-import', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    try {
+        const job = playlistImporter.start(req.params.channel, req.body);
+        res.status(202).json({ success: true, job });
+    } catch (err) {
+        res.status(err.status || 500).json({ error: err.message });
+    }
+});
+
+app.get('/api/local/:channel/playlist-import', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    res.json({ job: playlistImporter.status(req.params.channel) });
+});
+
+app.delete('/api/local/:channel/playlist-import/:id', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    try {
+        res.json({ success: true, job: playlistImporter.cancel(req.params.channel, req.params.id) });
+    } catch (err) {
+        res.status(err.status || 500).json({ error: err.message });
+    }
+});
+
+// Queue saved MP3s through the same personal list as pasted media URLs.
+app.post('/api/local/:channel/queue', requireAuth, async (req, res) => {
+    const channel = req.params.channel;
+    if (!hasAccess(req.session.user, channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    const { folder = '', filename } = req.body;
+    if (typeof folder !== 'string' || sanitisePath(folder) !== folder
+        || (filename !== undefined && (typeof filename !== 'string' || !filename
+            || sanitisePath(filename) !== filename || !filename.toLowerCase().endsWith('.mp3'))))
+        return res.status(400).json({ error: 'Invalid folder or MP3 filename.' });
+    try {
+        let files = await listLocalFiles(channel, folder);
+        if (filename !== undefined) files = files.filter(file => file.folder === folder && file.name === filename);
+        if (files.length === 0) return res.status(404).json({ error: 'No MP3 files found.' });
+        const data = loadChannelMyList(channel);
+        const addedAt = new Date().toISOString();
+        for (const file of files) {
+            const parts = [channel, ...(file.folder ? [file.folder] : []), file.name];
+            data.items.push({
+                url: `/api/local-media/${parts.map(encodeURIComponent).join('/')}`,
+                title: file.name, platform: 'local', addedAt
+            });
+        }
+        saveChannelMyList(channel, data);
+        io.to(`ch:${channel}`).emit('queue:update', { channel });
+        res.json({ success: true, added: files.length, total: data.items.length });
+    } catch {
+        res.status(500).json({ error: 'Could not add local files to My List.' });
+    }
+});
 
 function localMediaDir(channel, folder = '') {
     const dir = path.join(LOCAL_MEDIA_ROOT, sanitisePath(channel), sanitisePath(folder));
@@ -1103,7 +1224,7 @@ app.get('/api/local/:channel/folders', requireAuth, (req, res) => {
     try {
         const base = localMediaDir(req.params.channel);
         const entries = fs.readdirSync(base, { withFileTypes: true });
-        const folders = entries.filter(e => e.isDirectory()).map(e => e.name).sort();
+        const folders = entries.filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => e.name).sort();
         res.json({ folders });
     } catch (e) {
         res.status(500).json({ error: 'Could not list folders.' });
@@ -1129,6 +1250,9 @@ app.delete('/api/local/:channel/folders/:folder', requireAuth, (req, res) => {
     if (!hasAccess(req.session.user, req.params.channel))
         return res.status(403).json({ error: 'Access denied.' });
     try {
+        const job = playlistImporter.status(req.params.channel);
+        if (job?.status === 'running' && job.folder === req.params.folder)
+            return res.status(409).json({ error: 'Cancel the playlist import before deleting this folder.' });
         const dir = localMediaDir(req.params.channel, req.params.folder);
         fs.rmSync(dir, { recursive: true, force: true });
         res.json({ success: true });
@@ -1161,7 +1285,7 @@ async function listLocalFiles(channel, folder) {
         // Show files in root AND in each subfolder
         const entries = fs.readdirSync(base, { withFileTypes: true });
         for (const e of entries) {
-            if (e.isDirectory()) {
+            if (e.isDirectory() && !e.name.startsWith('.')) {
                 const subDir = path.join(base, e.name);
                 const subs = fs.readdirSync(subDir, { withFileTypes: true });
                 for (const s of subs) {

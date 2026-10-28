@@ -1,3 +1,6 @@
 node_modules/
 .env
 .dist/
+/data/local-media/
+/data/audio-settings/
+/tests/.tmp-*/

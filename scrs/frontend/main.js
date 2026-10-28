@@ -25,6 +25,8 @@ const copyObsUrlBtn   = document.getElementById('copy-obs-url-btn');
 const popoutBtn       = document.getElementById('popout-btn');
 const nowPlaying      = document.getElementById('now-playing-info');
 const skipCurrentBtn  = document.getElementById('skip-current-btn');
+const pauseCurrentBtn = document.getElementById('pause-current-btn');
+let channelAudioPaused = false;
 const queueCount      = document.getElementById('queue-count');
 const queueEmpty      = document.getElementById('queue-empty');
 const queueTable      = document.getElementById('queue-table');
@@ -42,11 +44,12 @@ const mylistCount     = document.getElementById('mylist-count');
 const mylistEmpty     = document.getElementById('mylist-empty');
 const mylistTable     = document.getElementById('mylist-table');
 const mylistTbody     = document.getElementById('mylist-tbody');
-const mylistLoopToggle = document.getElementById('mylist-loop-toggle');
+const mylistLoopBtn = document.getElementById('mylist-loop-btn');
 const mylistShuffleBtn = document.getElementById('mylist-shuffle-btn');
 const mylistPlaybackStatus = document.getElementById('mylist-playback-status');
 let savingMode = false;
 let shufflingMyList = false;
+let mylistLoopEnabled = false;
 
 // Mode selector
 const modeSelect      = document.getElementById('mode-select');
@@ -65,7 +68,18 @@ const localFileCount      = document.getElementById('local-file-count');
 const localFileEmpty      = document.getElementById('local-file-empty');
 const localFileTable      = document.getElementById('local-file-table');
 const localFileTbody      = document.getElementById('local-file-tbody');
+const localQueueFolderBtn = document.getElementById('local-queue-folder-btn');
+const localPlaylistUrl = document.getElementById('local-playlist-url');
+const localPlaylistImportBtn = document.getElementById('local-playlist-import-btn');
+const localPlaylistCancelBtn = document.getElementById('local-playlist-cancel-btn');
+const localPlaylistProgress = document.getElementById('local-playlist-progress');
+const localPlaylistStatus = document.getElementById('local-playlist-status');
 let   localCurrentFolder  = '';   // '' = all files
+let localQueueBusy = false;
+let localImportJob = null;
+let localImportTimer = null;
+let localImportStarting = false;
+let localImportSequence = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -119,8 +133,8 @@ async function loadMode() {
         const data = await res.json();
         if (channel !== currentChannel || savingMode) return;
         modeSelect.value = data.mode || 'requests';
-        mylistLoopToggle.checked = data.mylistLoop === true;
-        mylistLoopToggle.disabled = false;
+        renderLoopButton(data.mylistLoop === true);
+        mylistLoopBtn.disabled = false;
     } catch (e) {
         if (channel === currentChannel) setMyListPlaybackStatus('Could not load playback settings.', true);
     }
@@ -131,12 +145,20 @@ function setMyListPlaybackStatus(message, error = false) {
     mylistPlaybackStatus.className = `is-size-7 mb-3 ${error ? 'has-text-danger' : 'has-text-success'}`;
 }
 
+function renderLoopButton(enabled) {
+    mylistLoopEnabled = enabled;
+    mylistLoopBtn.textContent = `↻ Loop My List: ${enabled ? 'On' : 'Off'}`;
+    mylistLoopBtn.setAttribute('aria-pressed', String(enabled));
+    mylistLoopBtn.classList.toggle('is-success', enabled);
+    mylistLoopBtn.classList.toggle('is-dark', !enabled);
+}
+
 async function saveMode(update) {
     const channel = currentChannel;
     if (!channel || savingMode) return;
     savingMode = true;
     modeSelect.disabled = true;
-    mylistLoopToggle.disabled = true;
+    mylistLoopBtn.disabled = true;
     try {
         const res = await fetch(`/api/mode/${encodeURIComponent(channel)}`, {
             method:  'POST',
@@ -147,11 +169,11 @@ async function saveMode(update) {
         if (!res.ok) throw new Error(data.error || 'Could not save playback settings.');
         if (channel !== currentChannel) return;
         modeSelect.value = data.mode;
-        mylistLoopToggle.checked = data.mylistLoop === true;
+        renderLoopButton(data.mylistLoop === true);
         setMyListPlaybackStatus(update.mylistLoop === undefined
             ? 'Play mode updated.'
             : `Loop ${data.mylistLoop ? 'on' : 'off'}.`);
-        if (activeQueueTab === 'mylist') await loadMyList();
+        await loadMyList();
     } catch (e) {
         console.error('Failed to set mode', e);
         if (channel === currentChannel) setMyListPlaybackStatus('Could not save playback settings. Please try again.', true);
@@ -163,7 +185,7 @@ async function saveMode(update) {
 }
 
 modeSelect.addEventListener('change', () => saveMode({ mode: modeSelect.value }));
-mylistLoopToggle.addEventListener('change', () => saveMode({ mylistLoop: mylistLoopToggle.checked }));
+mylistLoopBtn.addEventListener('click', () => saveMode({ mylistLoop: !mylistLoopEnabled }));
 
 // ── My List helpers ──────────────────────────────────────────────────────────
 
@@ -181,7 +203,7 @@ function renderMylistTitle(item) {
 }
 
 function mylistPlatformTag(platform) {
-    const map = { youtube: 'is-danger', 'youtube-playlist': 'is-warning', spotify: 'is-success' };
+    const map = { youtube: 'is-danger', 'youtube-playlist': 'is-warning', spotify: 'is-success', local: 'is-info' };
     const cls = map[platform] || 'is-dark';
     const label = platform === 'youtube-playlist' ? 'playlist' : (platform || 'other');
     return `<span class="tag ${cls} is-small">${esc(label)}</span>`;
@@ -320,7 +342,7 @@ function setupQueueTypeTabs() {
             panelMylist.style.display   = activeQueueTab === 'mylist'   ? '' : 'none';
             panelLocal.style.display    = activeQueueTab === 'local'    ? '' : 'none';
             if (activeQueueTab === 'mylist') loadMyList();
-            if (activeQueueTab === 'local')  { loadLocalFolders(); loadLocalFiles(); }
+            if (activeQueueTab === 'local')  { loadLocalFolders(); loadLocalFiles(); loadLocalImport(); }
         });
     });
 
@@ -337,6 +359,12 @@ function setupQueueTypeTabs() {
         if (e.key === 'Enter') createLocalFolder();
     });
     localFileInput.addEventListener('change', uploadLocalFiles);
+    localPlaylistImportBtn.addEventListener('click', startLocalImport);
+    localPlaylistUrl.addEventListener('keydown', e => {
+        if (e.key === 'Enter') startLocalImport();
+    });
+    localPlaylistCancelBtn.addEventListener('click', cancelLocalImport);
+    localQueueFolderBtn.addEventListener('click', () => queueLocalFiles(localCurrentFolder));
     localFolderSelect.addEventListener('change', () => {
         localCurrentFolder = localFolderSelect.value;
         loadLocalFiles();
@@ -346,11 +374,13 @@ function setupQueueTypeTabs() {
 // ── Local Files API ───────────────────────────────────────────────────────────
 
 async function loadLocalFolders() {
-    if (!currentChannel) return;
+    const channel = currentChannel;
+    if (!channel) return;
     try {
-        const res  = await fetch(`/api/local/${encodeURIComponent(currentChannel)}/folders`);
+        const res  = await fetch(`/api/local/${encodeURIComponent(channel)}/folders`);
         if (!res.ok) throw new Error(res.status);
         const data = await res.json();
+        if (channel !== currentChannel) return;
         const folders = Array.isArray(data.folders) ? data.folders : [];
         // Rebuild folder select dropdown
         localFolderSelect.innerHTML = '<option value="">(all folders)</option>' +
@@ -411,8 +441,10 @@ async function createLocalFolder() {
 async function deleteLocalFolder(name) {
     if (!confirm(`Delete folder "${name}" and all files inside?`)) return;
     try {
-        await fetch(`/api/local/${encodeURIComponent(currentChannel)}/folders/${encodeURIComponent(name)}`,
+        const res = await fetch(`/api/local/${encodeURIComponent(currentChannel)}/folders/${encodeURIComponent(name)}`,
                     { method: 'DELETE' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not delete folder.');
         if (localCurrentFolder === name) {
             localCurrentFolder = '';
             localFolderSelect.value = '';
@@ -421,18 +453,23 @@ async function deleteLocalFolder(name) {
         await loadLocalFiles();
     } catch (e) {
         console.error('Failed to delete folder', e);
+        localFolderStatus.textContent = e.message;
+        localFolderStatus.className = 'is-size-7 mb-3 has-text-danger';
     }
 }
 
 async function loadLocalFiles() {
-    if (!currentChannel) return;
+    const channel = currentChannel;
+    if (!channel) return;
     try {
         const folder = localCurrentFolder ? `/${encodeURIComponent(localCurrentFolder)}` : '';
-        const res = await fetch(`/api/local/${encodeURIComponent(currentChannel)}/files${folder}`);
+        const res = await fetch(`/api/local/${encodeURIComponent(channel)}/files${folder}`);
         if (!res.ok) throw new Error(res.status);
         const data = await res.json();
+        if (channel !== currentChannel || folder !== (localCurrentFolder ? `/${encodeURIComponent(localCurrentFolder)}` : '')) return;
         const files = Array.isArray(data.files) ? data.files : [];
         localFileCount.textContent = files.length;
+        localQueueFolderBtn.disabled = localQueueBusy || files.length === 0;
         if (files.length === 0) {
             localFileEmpty.style.display = '';
             localFileTable.style.display = 'none';
@@ -447,6 +484,9 @@ async function loadLocalFiles() {
                 <td>${esc(f.folder || '—')}</td>
                 <td>
                     <div class="buttons are-small">
+                        <button class="button is-info is-small"
+                                data-lf-queue="${esc(f.folder || '')}||${esc(f.name)}"
+                                title="Add this MP3 to My List">+ My List</button>
                         <button class="button is-success is-small"
                                 data-lf-play="${esc(f.folder || '')}||${esc(f.name)}"
                                 title="Play now">▶ Play</button>
@@ -463,6 +503,12 @@ async function loadLocalFiles() {
                 playLocalNow(folder, name);
             });
         });
+        localFileTbody.querySelectorAll('button[data-lf-queue]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const [folder, name] = btn.dataset.lfQueue.split('||');
+                queueLocalFiles(folder, name, btn);
+            });
+        });
         localFileTbody.querySelectorAll('button[data-lf-delete]').forEach(btn => {
             btn.addEventListener('click', () => {
                 const [folder, name] = btn.dataset.lfDelete.split('||');
@@ -471,6 +517,145 @@ async function loadLocalFiles() {
         });
     } catch (e) {
         console.error('Failed to load local files', e);
+    }
+}
+
+async function queueLocalFiles(folder, filename, button) {
+    const channel = currentChannel;
+    if (!channel || localQueueBusy) return;
+    localQueueBusy = true;
+    localQueueFolderBtn.disabled = true;
+    if (button) button.disabled = true;
+    try {
+        const res = await fetch(`/api/local/${encodeURIComponent(channel)}/queue`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder, ...(filename === undefined ? {} : { filename }) })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not add local files.');
+        if (channel !== currentChannel) return;
+        setMyListPlaybackStatus(`Added ${data.added} local song${data.added === 1 ? '' : 's'} to My List.`);
+        await loadMyList();
+    } catch (err) {
+        if (channel === currentChannel) setMyListPlaybackStatus(err.message || 'Could not add local files.', true);
+    } finally {
+        localQueueBusy = false;
+        if (button) button.disabled = false;
+        if (activeQueueTab === 'local') await loadLocalFiles();
+    }
+}
+
+function scheduleLocalImportPoll() {
+    clearTimeout(localImportTimer);
+    localImportTimer = setTimeout(() => {
+        localImportTimer = null;
+        loadLocalImport();
+    }, 1500);
+}
+
+function renderLocalImport(job) {
+    const previous = localImportJob;
+    localImportJob = job;
+    const running = job?.status === 'running';
+    localPlaylistImportBtn.disabled = localImportStarting || running;
+    localPlaylistCancelBtn.hidden = !running;
+    localPlaylistCancelBtn.disabled = job?.cancelling === true;
+    localPlaylistProgress.hidden = !job;
+    clearTimeout(localImportTimer);
+    if (!job) {
+        localPlaylistStatus.textContent = '';
+        localPlaylistProgress.value = 0;
+        return;
+    }
+    if (job.total) localPlaylistProgress.value = Math.round(job.processed / job.total * 100);
+    else localPlaylistProgress.removeAttribute('value');
+    const counts = `${job.saved} saved, ${job.skipped} already saved, ${job.failed} failed`;
+    if (running) {
+        localPlaylistStatus.textContent = job.cancelling ? `Cancelling… ${counts}.`
+            : job.total ? `${job.processed}/${job.total} processed · ${counts}. Saving: ${job.currentTitle || '…'}`
+                : 'Reading playlist…';
+        localPlaylistStatus.className = 'is-size-7 mb-0 has-text-grey-light';
+        scheduleLocalImportPoll();
+    } else {
+        const label = { completed: 'Download complete', partial: 'Download finished with some unavailable songs',
+            cancelled: 'Download cancelled', failed: 'Download failed' }[job.status] || 'Download finished';
+        localPlaylistStatus.textContent = `${label}: ${counts}. Folder: ${job.folder}. ${job.error || job.warnings?.[0] || ''}`;
+        localPlaylistStatus.className = `is-size-7 mb-0 ${job.status === 'failed' ? 'has-text-danger'
+            : job.status === 'completed' ? 'has-text-success' : 'has-text-warning'}`;
+    }
+    if (activeQueueTab === 'local' && (!previous || previous.saved !== job.saved || previous.status !== job.status)) {
+        loadLocalFolders();
+        loadLocalFiles();
+    }
+}
+
+async function loadLocalImport() {
+    const channel = currentChannel;
+    if (!channel || localImportStarting) return;
+    const sequence = ++localImportSequence;
+    try {
+        const res = await fetch(`/api/local/${encodeURIComponent(channel)}/playlist-import`);
+        if (!res.ok) throw new Error(res.status);
+        const data = await res.json();
+        if (channel !== currentChannel || sequence !== localImportSequence) return;
+        renderLocalImport(data.job);
+    } catch {
+        if (channel !== currentChannel || sequence !== localImportSequence) return;
+        localPlaylistStatus.textContent = 'Could not read download progress. Reopen Local Files to retry.';
+        if (localImportJob?.status === 'running') scheduleLocalImportPoll();
+    }
+}
+
+async function startLocalImport() {
+    const channel = currentChannel;
+    const url = localPlaylistUrl.value.trim();
+    if (!channel || !url || localImportStarting || localImportJob?.status === 'running') return;
+    localImportStarting = true;
+    localImportSequence++;
+    clearTimeout(localImportTimer);
+    localPlaylistImportBtn.disabled = true;
+    localPlaylistStatus.textContent = 'Starting playlist download…';
+    try {
+        const res = await fetch(`/api/local/${encodeURIComponent(channel)}/playlist-import`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, folder: localCurrentFolder })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not start playlist download.');
+        if (channel !== currentChannel) return;
+        localPlaylistUrl.value = '';
+        localCurrentFolder = data.job.folder;
+        renderLocalImport(data.job);
+        await loadLocalFolders();
+        await loadLocalFiles();
+    } catch (err) {
+        if (channel === currentChannel) {
+            localPlaylistStatus.textContent = err.message || 'Could not start playlist download.';
+            localPlaylistStatus.className = 'is-size-7 mb-0 has-text-danger';
+        }
+    } finally {
+        localImportStarting = false;
+        localPlaylistImportBtn.disabled = localImportJob?.status === 'running';
+        if (channel !== currentChannel) loadLocalImport();
+    }
+}
+
+async function cancelLocalImport() {
+    const channel = currentChannel;
+    const job = localImportJob;
+    if (!channel || !job || job.status !== 'running') return;
+    localPlaylistCancelBtn.disabled = true;
+    try {
+        const res = await fetch(`/api/local/${encodeURIComponent(channel)}/playlist-import/${encodeURIComponent(job.id)}`,
+            { method: 'DELETE' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not cancel download.');
+        if (channel === currentChannel) renderLocalImport(data.job);
+    } catch (err) {
+        if (channel === currentChannel) {
+            localPlaylistStatus.textContent = err.message || 'Could not cancel download.';
+            localPlaylistCancelBtn.disabled = false;
+        }
     }
 }
 
@@ -633,6 +818,46 @@ async function skipCurrent() {
 
 if (skipCurrentBtn) skipCurrentBtn.addEventListener('click', skipCurrent);
 
+function renderChannelPause(settings) {
+    channelAudioPaused = settings.paused === true;
+    pauseCurrentBtn.textContent = channelAudioPaused ? '▶ Resume' : '⏸ Pause';
+    pauseCurrentBtn.setAttribute('aria-pressed', String(channelAudioPaused));
+}
+
+async function loadChannelAudioSettings() {
+    const channel = currentChannel;
+    if (!channel) return;
+    try {
+        const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/audio-settings`);
+        if (!res.ok) throw new Error(res.status);
+        const data = await res.json();
+        if (channel !== currentChannel) return;
+        renderChannelPause(data.settings);
+        pauseCurrentBtn.disabled = false;
+    } catch {
+        if (channel === currentChannel) setMyListPlaybackStatus('Could not load saved audio settings.', true);
+    }
+}
+
+pauseCurrentBtn.addEventListener('click', async () => {
+    const channel = currentChannel;
+    if (!channel || pauseCurrentBtn.disabled) return;
+    pauseCurrentBtn.disabled = true;
+    try {
+        const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/audio-settings`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ paused: !channelAudioPaused })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not pause/resume playback.');
+        if (channel === currentChannel) renderChannelPause(data.settings);
+    } catch (err) {
+        if (channel === currentChannel) setMyListPlaybackStatus(err.message, true);
+    } finally {
+        if (channel === currentChannel) pauseCurrentBtn.disabled = false;
+    }
+});
+
 // ── Channel switching ─────────────────────────────────────────────────────────
 
 // The full standalone overlay URL for the current channel (no &controls), used
@@ -644,10 +869,16 @@ function switchChannel(channel) {
     if (socket && currentChannel) socket.emit('leave:channel', currentChannel);
 
     currentChannel = channel;
-    mylistLoopToggle.checked = false;
-    mylistLoopToggle.disabled = true;
+    renderChannelPause({ paused: false });
+    pauseCurrentBtn.disabled = true;
+    renderLoopButton(false);
+    mylistLoopBtn.disabled = true;
     mylistShuffleBtn.disabled = true;
     setMyListPlaybackStatus('');
+    localImportSequence++;
+    renderLocalImport(null);
+    localCurrentFolder = '';
+    localQueueFolderBtn.disabled = true;
 
     tabList.querySelectorAll('li').forEach(li =>
         li.classList.toggle('is-active', li.dataset.channel === channel));
@@ -662,7 +893,9 @@ function switchChannel(channel) {
     if (socket) socket.emit('join:channel', channel);
     loadMedia();
     loadMode();
-    if (activeQueueTab === 'mylist') loadMyList();
+    loadChannelAudioSettings();
+    loadMyList();
+    loadLocalImport();
     if (activeQueueTab === 'local')  { loadLocalFolders(); loadLocalFiles(); }
 }
 
@@ -753,7 +986,15 @@ async function init() {
         loadMode();
         // Promotion consumes or rotates My List, so keep its displayed order
         // and the loop setting in sync across dashboards.
-        if (activeQueueTab === 'mylist') loadMyList();
+        loadMyList();
+    });
+    socket.on('audio:settings', ({ channel, settings }) => {
+        if (channel === currentChannel) renderChannelPause(settings);
+    });
+    socket.on('local:import:update', ({ channel, job }) => {
+        if (channel !== currentChannel) return;
+        localImportSequence++;
+        renderLocalImport(job);
     });
 
     setupQueueTypeTabs();

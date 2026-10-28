@@ -7,3 +7,6 @@ docker-compose*.yml
 README*
 *.md
 *.log
+data/local-media/
+data/audio-settings/
+tests/.tmp-*/

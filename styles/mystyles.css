@@ -135,9 +135,32 @@
 .queue-box > .heading,
 .queue-box > #now-playing-info,
 .queue-box > #skip-current-btn,
+.queue-box > #pause-current-btn,
 .queue-box > .queue-divider,
+.queue-box > #mylist-playback-controls,
 .queue-box > .level {
     flex-shrink: 0;
+}
+
+#mylist-playback-controls .buttons {
+    flex-wrap: wrap;
+    gap: 0.4rem;
+}
+
+.local-playlist-import {
+    padding: 12px;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    background: #171d28;
+}
+
+.local-playlist-import .label { color: #e0e0e0; }
+.local-playlist-import [hidden] { display: none !important; }
+
+#local-playlist-url {
+    background: #1a1a1a;
+    border-color: #444;
+    color: #e0e0e0;
 }
 
 /* The panels share the leftover space and scroll internally instead of
