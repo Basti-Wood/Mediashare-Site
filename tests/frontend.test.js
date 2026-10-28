@@ -7,6 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { setImmediate: nextTick } = require('node:timers/promises');
 const { createTestServer } = require('./helpers/server');
+const { createDownloader } = require('./helpers/downloader');
 
 // Exercise the real frontend event handlers against the real local API.
 // Minimal DOM/audio stand-ins keep this suite runnable without a browser or
@@ -19,7 +20,10 @@ function frontend(h, file, cookie) {
     function element(id) {
         if (!elements.has(id)) elements.set(id, {
             id, value: '', textContent: '', innerHTML: '', checked: false,
-            disabled: false, style: {}, dataset: {}, handlers: new Map(),
+            disabled: false, style: {}, dataset: {}, handlers: new Map(), attributes: {},
+            setAttribute(name, value) { this.attributes[name] = value; },
+            getAttribute(name) { return this.attributes[name]; },
+            removeAttribute(name) { delete this.attributes[name]; },
             classList: { add() {}, remove() {}, toggle() {} },
             addEventListener(event, handler) { this.handlers.set(event, handler); },
             querySelectorAll() { return []; }, querySelector() { return null; },
@@ -65,8 +69,8 @@ async function until(predicate) {
     throw new Error('Frontend did not reach expected state');
 }
 
-async function setup(t) {
-    const h = await createTestServer({ random: () => 0 });
+async function setup(t, options = {}) {
+    const h = await createTestServer({ random: () => 0, ...options });
     t.after(() => h.close());
     const cookie = await h.login();
     h.api = (url, method = 'GET', body) => h.request(url, { method, body, cookie });
@@ -92,9 +96,8 @@ test('dashboard handlers save loop, shuffle the list and restore channel setting
     input.value = 'https://youtu.be/BBBBBBBBBBB';
     await add.fire('click');
     assert.equal(shuffle.disabled, false);
-    const loop = ui.elements.get('mylist-loop-toggle');
-    loop.checked = true;
-    await loop.fire('change');
+    const loop = ui.elements.get('mylist-loop-btn');
+    await loop.fire('click');
     assert.equal((await h.api('/api/mode/alice')).data.mylistLoop, true);
     assert.equal(ui.elements.get('mylist-playback-status').textContent, 'Loop on.');
     const before = (await h.api('/api/mylist/alice')).data.items.map(item => item.title);
@@ -105,12 +108,12 @@ test('dashboard handlers save loop, shuffle the list and restore channel setting
     const reload = frontend(h, 'main.js', h.cookie);
     await reload.ready;
     await reload.run('loadMode()');
-    assert.equal(reload.elements.get('mylist-loop-toggle').checked, true);
+    assert.equal(reload.elements.get('mylist-loop-btn').getAttribute('aria-pressed'), 'true');
     assert.deepEqual(ui.errors, []);
     assert.deepEqual(reload.errors, []);
 });
 
-test('failed loop saves restore the checkbox and show an actionable error', async t => {
+test('failed loop saves restore the button and show an actionable error', async t => {
     const h = await setup(t);
     const ui = frontend(h, 'main.js', h.cookie);
     await ui.ready;
@@ -119,12 +122,80 @@ test('failed loop saves restore the checkbox and show an actionable error', asyn
     ui.context.fetch = (url, options = {}) => options.method === 'POST' && url === '/api/mode/alice'
         ? Promise.resolve(new Response(JSON.stringify({ error: 'Unavailable' }), { status: 503 }))
         : original(url, options);
-    const loop = ui.elements.get('mylist-loop-toggle');
-    loop.checked = true;
-    await loop.fire('change');
-    assert.equal(loop.checked, false);
+    const loop = ui.elements.get('mylist-loop-btn');
+    await loop.fire('click');
+    assert.equal(loop.getAttribute('aria-pressed'), 'false');
     assert.equal(loop.disabled, false);
     assert.match(ui.elements.get('mylist-playback-status').textContent, /Please try again/);
+});
+
+test('Loop and Shuffle are real buttons above every tab panel', () => {
+    const html = fs.readFileSync(path.resolve(__dirname, '../HTML/main.html'), 'utf8');
+    const toolbar = html.indexOf('id="mylist-playback-controls"');
+    const tabs = html.indexOf('id="queue-type-tabs"');
+    assert.ok(toolbar > 0 && toolbar < tabs);
+    for (const id of ['mylist-loop-btn', 'mylist-shuffle-btn']) {
+        const position = html.indexOf(`id="${id}"`);
+        assert.ok(position > toolbar && position < tabs);
+        assert.match(html.slice(html.lastIndexOf('<button', position), html.indexOf('>', position)), /type="button"/);
+    }
+    assert.equal(html.includes('mylist-loop-toggle'), false);
+});
+
+test('Local Files button imports a playlist, restores its progress and queues MP3s for the global controls', async t => {
+    const downloader = createDownloader();
+    const h = await setup(t, { spawn: downloader.spawn });
+    const ui = frontend(h, 'main.js', h.cookie);
+    await ui.ready;
+    await ui.elements.get('tab-local').fire('click');
+    ui.elements.get('local-playlist-url').value = 'https://youtube.com/playlist?list=PLtest123';
+    await ui.elements.get('local-playlist-import-btn').fire('click');
+    await h.settleImport();
+    await ui.run('loadLocalImport()');
+    await ui.run('loadLocalFiles()');
+    assert.match(ui.elements.get('local-playlist-status').textContent, /Download complete: 2 saved/);
+    assert.equal(ui.elements.get('local-playlist-import-btn').disabled, false);
+    assert.equal(ui.elements.get('local-playlist-cancel-btn').hidden, true);
+    assert.equal(ui.elements.get('local-queue-folder-btn').disabled, false);
+    await ui.elements.get('local-queue-folder-btn').fire('click');
+    const list = (await h.api('/api/mylist/alice')).data.items;
+    assert.equal(list.length, 2);
+    assert.ok(list.every(item => item.platform === 'local'));
+    assert.equal(ui.elements.get('mylist-shuffle-btn').disabled, false);
+    await ui.elements.get('mylist-loop-btn').fire('click');
+    assert.equal((await h.api('/api/mode/alice')).data.mylistLoop, true);
+    const reload = frontend(h, 'main.js', h.cookie);
+    await reload.ready;
+    await reload.run('loadLocalImport()');
+    assert.match(reload.elements.get('local-playlist-status').textContent, /2 saved/);
+    assert.deepEqual(ui.errors, []);
+    assert.deepEqual(reload.errors, []);
+});
+
+test('playlist import button displays invalid URL feedback and can be retried', async t => {
+    const h = await setup(t);
+    const ui = frontend(h, 'main.js', h.cookie);
+    await ui.ready;
+    ui.elements.get('local-playlist-url').value = 'https://example.com/playlist?list=bad';
+    await ui.elements.get('local-playlist-import-btn').fire('click');
+    assert.match(ui.elements.get('local-playlist-status').textContent, /YouTube playlist URL/);
+    assert.equal(ui.elements.get('local-playlist-import-btn').disabled, false);
+});
+
+test('the download cancellation button stops an active playlist import', async t => {
+    const downloader = createDownloader({ blockId: 'AAAAAAAAAAA' });
+    const h = await setup(t, { spawn: downloader.spawn });
+    const ui = frontend(h, 'main.js', h.cookie);
+    await ui.ready;
+    ui.elements.get('local-playlist-url').value = 'https://youtube.com/playlist?list=PLtest123';
+    await ui.elements.get('local-playlist-import-btn').fire('click');
+    await until(() => downloader.blocked.length > 0);
+    assert.equal(ui.elements.get('local-playlist-cancel-btn').hidden, false);
+    await ui.elements.get('local-playlist-cancel-btn').fire('click');
+    await h.settleImport();
+    await ui.run('loadLocalImport()');
+    assert.match(ui.elements.get('local-playlist-status').textContent, /Download cancelled/);
+    assert.equal(ui.elements.get('local-playlist-import-btn').disabled, false);
 });
 
 test('overlay ended events restart a one-song loop without replaying it on ordinary polls', async t => {

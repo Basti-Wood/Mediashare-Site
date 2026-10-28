@@ -11,6 +11,7 @@ const { execFile, spawn } = require('child_process');
 const multer   = require('multer');
 const WebSocket = require('ws');
 const { Server } = require('socket.io');
+const { createPlaylistImporter } = require('./playlist-imports');
 
 const app    = express();
 const server = http.createServer(app);
@@ -1050,7 +1051,71 @@ app.post('/api/webhook/:ch', (req, res) => {
 
 // ── Local media (MP3 upload, folder management, instant playback) ─────────────
 
-const LOCAL_MEDIA_ROOT = path.join(__dirname, '../..', 'data', 'local-media');
+const LOCAL_MEDIA_ROOT = process.env.LOCAL_MEDIA_ROOT || path.join(__dirname, '../..', 'data', 'local-media');
+const playlistImporter = createPlaylistImporter({
+    root: LOCAL_MEDIA_ROOT,
+    spawn,
+    normalizeFile: normalizeAudioFile,
+    onChange: (channel, job) => io.to(`ch:${channel}`).emit('local:import:update', { channel, job })
+});
+
+app.post('/api/local/:channel/playlist-import', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    try {
+        const job = playlistImporter.start(req.params.channel, req.body);
+        res.status(202).json({ success: true, job });
+    } catch (err) {
+        res.status(err.status || 500).json({ error: err.message });
+    }
+});
+
+app.get('/api/local/:channel/playlist-import', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    res.json({ job: playlistImporter.status(req.params.channel) });
+});
+
+app.delete('/api/local/:channel/playlist-import/:id', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    try {
+        res.json({ success: true, job: playlistImporter.cancel(req.params.channel, req.params.id) });
+    } catch (err) {
+        res.status(err.status || 500).json({ error: err.message });
+    }
+});
+
+// Queue saved MP3s through the same personal list as pasted media URLs.
+app.post('/api/local/:channel/queue', requireAuth, async (req, res) => {
+    const channel = req.params.channel;
+    if (!hasAccess(req.session.user, channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    const { folder = '', filename } = req.body;
+    if (typeof folder !== 'string' || sanitisePath(folder) !== folder
+        || (filename !== undefined && (typeof filename !== 'string' || !filename
+            || sanitisePath(filename) !== filename || !filename.toLowerCase().endsWith('.mp3'))))
+        return res.status(400).json({ error: 'Invalid folder or MP3 filename.' });
+    try {
+        let files = await listLocalFiles(channel, folder);
+        if (filename !== undefined) files = files.filter(file => file.folder === folder && file.name === filename);
+        if (files.length === 0) return res.status(404).json({ error: 'No MP3 files found.' });
+        const data = loadChannelMyList(channel);
+        const addedAt = new Date().toISOString();
+        for (const file of files) {
+            const parts = [channel, ...(file.folder ? [file.folder] : []), file.name];
+            data.items.push({
+                url: `/api/local-media/${parts.map(encodeURIComponent).join('/')}`,
+                title: file.name, platform: 'local', addedAt
+            });
+        }
+        saveChannelMyList(channel, data);
+        io.to(`ch:${channel}`).emit('queue:update', { channel });
+        res.json({ success: true, added: files.length, total: data.items.length });
+    } catch {
+        res.status(500).json({ error: 'Could not add local files to My List.' });
+    }
+});
 
 function localMediaDir(channel, folder = '') {
     const dir = path.join(LOCAL_MEDIA_ROOT, sanitisePath(channel), sanitisePath(folder));
@@ -1103,7 +1168,7 @@ app.get('/api/local/:channel/folders', requireAuth, (req, res) => {
     try {
         const base = localMediaDir(req.params.channel);
         const entries = fs.readdirSync(base, { withFileTypes: true });
-        const folders = entries.filter(e => e.isDirectory()).map(e => e.name).sort();
+        const folders = entries.filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => e.name).sort();
         res.json({ folders });
     } catch (e) {
         res.status(500).json({ error: 'Could not list folders.' });
@@ -1129,6 +1194,9 @@ app.delete('/api/local/:channel/folders/:folder', requireAuth, (req, res) => {
     if (!hasAccess(req.session.user, req.params.channel))
         return res.status(403).json({ error: 'Access denied.' });
     try {
+        const job = playlistImporter.status(req.params.channel);
+        if (job?.status === 'running' && job.folder === req.params.folder)
+            return res.status(409).json({ error: 'Cancel the playlist import before deleting this folder.' });
         const dir = localMediaDir(req.params.channel, req.params.folder);
         fs.rmSync(dir, { recursive: true, force: true });
         res.json({ success: true });
@@ -1161,7 +1229,7 @@ async function listLocalFiles(channel, folder) {
         // Show files in root AND in each subfolder
         const entries = fs.readdirSync(base, { withFileTypes: true });
         for (const e of entries) {
-            if (e.isDirectory()) {
+            if (e.isDirectory() && !e.name.startsWith('.')) {
                 const subDir = path.join(base, e.name);
                 const subs = fs.readdirSync(subDir, { withFileTypes: true });
                 for (const s of subs) {
