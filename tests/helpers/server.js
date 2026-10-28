@@ -26,14 +26,17 @@ async function createTestServer(options = {}) {
 
     const sandbox = {
         __dirname: path.dirname(serverFile),
-        process: { env: { SESSION_SECRET: 'test-only', BASTI_POLLING_ONLY: 'true', LOCAL_MEDIA_ROOT: localRoot } },
+        process: { env: { SESSION_SECRET: 'test-only', BASTI_POLLING_ONLY: 'true', LOCAL_MEDIA_ROOT: localRoot,
+            AUDIO_SETTINGS_ROOT: path.join(localRoot, '.audio-settings') } },
         console: { log() {}, warn() {}, error() {} },
         Buffer, URL, URLSearchParams, setTimeout, clearTimeout, setInterval, clearInterval,
         Math: Object.assign(Object.create(Math), { random: options.random || Math.random }),
         require(name) {
             if (name === 'dotenv') return { config() {} };
-            if (name === 'child_process' && options.spawn)
-                return { ...serverRequire(name), spawn: options.spawn };
+            if (name === 'child_process' && (options.spawn || options.execFile))
+                return { ...serverRequire(name),
+                    ...(options.spawn ? { spawn: options.spawn } : {}),
+                    ...(options.execFile ? { execFile: options.execFile } : {}) };
             if (name === 'fs') return {
                 ...fs,
                 readFileSync(file, ...args) {

@@ -135,6 +135,7 @@
 .queue-box > .heading,
 .queue-box > #now-playing-info,
 .queue-box > #skip-current-btn,
+.queue-box > #pause-current-btn,
 .queue-box > .queue-divider,
 .queue-box > #mylist-playback-controls,
 .queue-box > .level {

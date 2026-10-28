@@ -17,6 +17,8 @@ function frontend(h, file, cookie) {
     const errors = [];
     const audios = [];
     const plays = [];
+    const youtubePlayers = [];
+    const socketHandlers = new Map();
     function element(id) {
         if (!elements.has(id)) elements.set(id, {
             id, value: '', textContent: '', innerHTML: '', checked: false,
@@ -43,7 +45,29 @@ function frontend(h, file, cookie) {
         navigator: {}, URLSearchParams,
         console: { log() {}, warn() {}, error: (...args) => errors.push(args) },
         setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 1; }, clearInterval() {},
-        io: () => ({ on() {}, emit() {} }),
+        io: () => ({ on(event, handler) { socketHandlers.set(event, handler); }, emit() {} }),
+        YT: {
+            PlayerState: { ENDED: 0, PLAYING: 1, PAUSED: 2 },
+            Player: class {
+                constructor(target, options) {
+                    this.target = target;
+                    this.options = options;
+                    this.muted = true;
+                    youtubePlayers.push(this);
+                }
+                mute() { this.muted = true; }
+                unMute() { this.muted = false; }
+                setVolume(value) { this.volume = value; }
+                playVideo() { this.playing = true; this.paused = false; }
+                pauseVideo() { this.playing = false; this.paused = true; }
+                loadVideoById(id) { this.videoId = id; }
+                destroy() { this.destroyed = true; }
+                fire(name, data) {
+                    if (name === 'onStateChange' && (data === 1 || data === 2)) this.paused = data === 2;
+                    return this.options.events[name]?.({ target: this, data });
+                }
+            }
+        },
         fetch: (url, options = {}) => fetch(h.base + url, {
             ...options, headers: { ...options.headers, ...(cookie ? { Cookie: cookie } : {}) }
         }),
@@ -58,7 +82,9 @@ function frontend(h, file, cookie) {
     });
     const source = fs.readFileSync(path.resolve(__dirname, '../scrs/frontend', file), 'utf8');
     const ready = vm.runInContext(source, context, { filename: file });
-    return { context, elements, errors, audios, plays, ready, run: code => vm.runInContext(code, context) };
+    return { context, elements, errors, audios, plays, youtubePlayers, ready,
+        emitSocket: (event, payload) => socketHandlers.get(event)?.(payload),
+        run: code => vm.runInContext(code, context) };
 }
 
 async function until(predicate) {
@@ -246,4 +272,181 @@ test('overlay ignores a stale current response arriving after advancement', asyn
     assert.equal(ui.run('currentItemId'), newId);
     assert.equal(ui.plays.length, 2);
     assert.deepEqual(ui.errors, []);
+});
+
+test('failed audio proxy falls back to audible YouTube playback without consuming the song', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const ui = frontend(h, 'overlay.js');
+    await ui.ready;
+    ui.context.window.onYouTubeIframeAPIReady();
+    const picture = ui.youtubePlayers.at(-1);
+    picture.fire('onReady');
+    assert.equal(picture.muted, true);
+    const id = ui.run('currentItemId');
+    ui.audios[0].handlers.get('error')();
+    const audible = ui.youtubePlayers.at(-1);
+    assert.notEqual(audible, picture);
+    assert.equal(picture.destroyed, true);
+    audible.fire('onReady');
+    assert.equal(audible.muted, false);
+    assert.equal(audible.target, 'yt-player-mount');
+    assert.equal(ui.run('playbackMode'), 'youtube');
+    assert.equal(ui.run('currentItemId'), id);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+    // Muted picture events and failed iframe loads must not skip either.
+    picture.fire('onStateChange', 0);
+    audible.fire('onError', 100);
+    await nextTick();
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+    assert.match(ui.elements.get('playback-message').textContent, /could not play/);
+    await ui.elements.get('playback-skip-btn').fire('click');
+    await until(() => h.calls.some(call => call.action === 'removemedia'));
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
+});
+
+test('late iframe API arrival does not reload native audio and only audible playback endings advance', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const ui = frontend(h, 'overlay.js');
+    await ui.ready;
+    assert.equal(ui.plays.length, 1);
+    ui.context.window.onYouTubeIframeAPIReady();
+    assert.equal(ui.plays.length, 1);
+    ui.youtubePlayers.at(-1).fire('onStateChange', 0);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+    ui.audios[0].handlers.get('error')();
+    const player = ui.youtubePlayers.at(-1);
+    player.fire('onReady');
+    player.fire('onStateChange', 0);
+    await until(() => h.calls.some(call => call.action === 'removemedia'));
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
+});
+
+test('autoplay denial keeps native playback selected and offers a user-gesture retry', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const ui = frontend(h, 'overlay.js');
+    await ui.ready;
+    const audio = ui.audios[0];
+    audio.play = () => Promise.reject(Object.assign(new Error('Gesture required'), { name: 'NotAllowedError' }));
+    ui.run('startNativeAudio()');
+    await nextTick();
+    assert.equal(ui.run('playbackMode'), 'youtube-audio');
+    assert.match(ui.elements.get('playback-message').textContent, /allow audio playback/);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+    audio.play = () => Promise.resolve();
+    await ui.elements.get('playback-retry-btn').fire('click');
+    assert.equal(ui.run('playbackMode'), 'youtube-audio');
+});
+
+test('a failed local MP3 stays queued for Retry or an explicit Skip', async t => {
+    const h = await setup(t);
+    fs.mkdirSync(path.join(h.localRoot, 'alice'), { recursive: true });
+    fs.writeFileSync(path.join(h.localRoot, 'alice', 'test.mp3'), 'test');
+    await h.api('/api/local/alice/queue', 'POST', { filename: 'test.mp3' });
+    const ui = frontend(h, 'overlay.js');
+    await ui.ready;
+    const id = ui.run('currentItemId');
+    ui.audios[0].handlers.get('error')();
+    assert.equal(ui.run('currentItemId'), id);
+    assert.match(ui.elements.get('playback-message').textContent, /MP3 could not be loaded/);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+    await ui.elements.get('playback-retry-btn').fire('click');
+    assert.equal(ui.plays.length, 2);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+});
+
+test('volume is restored per user channel and saved after editing the player control', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    await h.api('/api/channels/alice/audio-settings', 'POST', { volume: 23.5 });
+    const ui = frontend(h, 'overlay.js', h.cookie);
+    await ui.ready;
+    assert.equal(ui.run('volumePercent'), 23.5);
+    assert.equal(ui.audios[0].volume, 23.5 / 100 * 0.5);
+    assert.equal(ui.elements.get('volume-percent').value, 23.5);
+    ui.elements.get('volume-percent').value = '37.5';
+    await ui.elements.get('volume-percent').fire('change');
+    await ui.run('flushAudioSettings()');
+    assert.equal((await h.api('/api/channels/alice/audio-settings')).data.settings.volume, 37.5);
+    assert.equal((await h.api('/api/channels/bob/audio-settings')).data.settings.volume, 100);
+    const reload = frontend(h, 'overlay.js', h.cookie);
+    await reload.ready;
+    assert.equal(reload.run('volumePercent'), 37.5);
+});
+
+test('restored pause prevents autoplay and Pause/Resume controls the native audio without skipping', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    await h.api('/api/channels/alice/audio-settings', 'POST', { volume: 40, paused: true });
+    const ui = frontend(h, 'overlay.js', h.cookie);
+    await ui.ready;
+    assert.equal(ui.plays.length, 0);
+    assert.equal(ui.audios[0].autoplay, false);
+    assert.equal(ui.elements.get('pause-resume-btn').getAttribute('aria-pressed'), 'true');
+    await ui.elements.get('pause-resume-btn').fire('click');
+    assert.equal(ui.audios[0].paused, false);
+    assert.equal(ui.plays.length, 1);
+    await ui.elements.get('pause-resume-btn').fire('click');
+    assert.equal(ui.audios[0].paused, true);
+    assert.equal((await h.api('/api/channels/alice/audio-settings')).data.settings.paused, true);
+    ui.elements.get('volume-percent').value = '18.25';
+    await ui.elements.get('volume-percent').fire('change');
+    await ui.run('flushAudioSettings()');
+    assert.equal(ui.audios[0].paused, true);
+    assert.equal((await h.api('/api/channels/alice/audio-settings')).data.settings.volume, 18.25);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+});
+
+test('pausing the muted YouTube picture pauses native audio and persists the shared state', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const ui = frontend(h, 'overlay.js', h.cookie);
+    await ui.ready;
+    ui.context.window.onYouTubeIframeAPIReady();
+    const player = ui.youtubePlayers.at(-1);
+    player.fire('onReady');
+    player.fire('onStateChange', 1);
+    player.fire('onStateChange', 2);
+    await ui.run('audioSettingsWrite');
+    assert.equal(ui.audios[0].paused, true);
+    assert.equal(player.paused, true);
+    assert.equal((await h.api('/api/channels/alice/audio-settings')).data.settings.paused, true);
+    player.fire('onStateChange', 2); // acknowledge the shared pause
+    player.fire('onStateChange', 1); // user resumes using the video controls
+    await ui.run('audioSettingsWrite');
+    assert.equal(ui.audios[0].paused, false);
+    assert.equal((await h.api('/api/channels/alice/audio-settings')).data.settings.paused, false);
+    player.fire('onStateChange', 2); // an immediate second pause must also work
+    await ui.run('audioSettingsWrite');
+    assert.equal(ui.audios[0].paused, true);
+    assert.equal((await h.api('/api/channels/alice/audio-settings')).data.settings.paused, true);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+});
+
+test('dashboard pause broadcasts to both preview and anonymous OBS without changing the song', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const dashboard = frontend(h, 'main.js', h.cookie);
+    await dashboard.ready;
+    await dashboard.run('loadChannelAudioSettings()');
+    const preview = frontend(h, 'overlay.js', h.cookie);
+    const obs = frontend(h, 'overlay.js');
+    await Promise.all([preview.ready, obs.ready]);
+    const playing = obs.run('currentItemId');
+    await dashboard.elements.get('pause-current-btn').fire('click');
+    const paused = h.events.filter(event => event.event === 'audio:settings').at(-1).payload;
+    preview.emitSocket('audio:settings', paused);
+    obs.emitSocket('audio:settings', paused);
+    assert.equal(preview.audios[0].paused, true);
+    assert.equal(obs.audios[0].paused, true);
+    assert.equal(obs.run('currentItemId'), playing);
+    await dashboard.elements.get('pause-current-btn').fire('click');
+    const resumed = h.events.filter(event => event.event === 'audio:settings').at(-1).payload;
+    preview.emitSocket('audio:settings', resumed);
+    obs.emitSocket('audio:settings', resumed);
+    assert.equal(preview.audios[0].paused, false);
+    assert.equal(obs.audios[0].paused, false);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
 });

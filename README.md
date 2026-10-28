@@ -21,8 +21,39 @@ playing. Loop repeats the list until switched off.
 
 Downloads preserve playlist order in numbered filenames. Unavailable tracks are
 reported while the remaining tracks continue. Existing files are kept. This uses
-`yt-dlp`, `ffmpeg` and Node.js; the Docker image includes them. If YouTube changes
-its download behavior, rebuild the image to get the current `yt-dlp` release.
+`yt-dlp`, `ffmpeg` and Node.js; the Docker image includes them. The image uses
+Node 24, satisfying yt-dlp's Node 22+ requirement for YouTube challenge solving.
+The audio resolver and importer explicitly enable the Node runtime. See the
+[yt-dlp runtime requirements](https://github.com/yt-dlp/yt-dlp/wiki/EJS#node).
+
+## If songs immediately skip or audio returns 502
+
+Audio loading failures keep the current song queued. A failed YouTube audio
+proxy switches to YouTube's embedded player; failed MP3 or embedded playback
+shows **Play / Retry** and **Skip this song**. Only a completed song or an
+explicit Skip advances the queue. Autoplay permission failures ask for a click.
+
+## Saved volume and shared Pause/Resume
+
+Volume and paused state are saved for each user's channel and restored before
+playback starts. They survive page reloads and server restarts, and are shared
+by the dashboard preview, pop-out and OBS player. Use **Pause / Resume** on the
+dashboard or the player's controls. Pausing the YouTube picture also pauses its
+native audio stream; it no longer leaves the sound playing separately.
+
+Change settings from a signed-in dashboard or pop-out. OBS can read and follow
+the saved settings without logging in. Each channel's preferences are separate;
+moderators with access to a channel can adjust that channel's audio. Settings
+live in `./data/audio-settings` under the same persistent data mount as MP3s.
+
+For an older deployed version, append `&ytmode=iframe` to the existing overlay
+URL as a temporary way to bypass the audio proxy. The permanent fix also updates
+the resolver, retains its HTTP headers, and removes stale stream URLs on failure.
+
+If the Local Files playlist form is missing, verify that the feature pull request
+has been merged and that your deployment has pulled that revision. Refresh the
+dashboard and OBS browser source after updating. The updated overlay script is
+versioned `audio-settings-4`.
 
 ## Update an existing Docker installation
 
@@ -39,12 +70,15 @@ recreate the container:
 
 ```sh
 git pull
-docker compose up -d --build
+docker compose build --pull --no-cache
+docker compose up -d
 ```
 
 Refresh the dashboard afterward. Uploads and downloads now live in
 `./data/local-media` on the host and survive container recreation. My List and
 play-mode settings still use the application's existing in-memory storage.
+The uncached rebuild is needed to install the newer Node runtime and refresh
+yt-dlp; a plain container restart keeps the old image and dependencies.
 
 ## Tests
 

@@ -25,6 +25,8 @@ const copyObsUrlBtn   = document.getElementById('copy-obs-url-btn');
 const popoutBtn       = document.getElementById('popout-btn');
 const nowPlaying      = document.getElementById('now-playing-info');
 const skipCurrentBtn  = document.getElementById('skip-current-btn');
+const pauseCurrentBtn = document.getElementById('pause-current-btn');
+let channelAudioPaused = false;
 const queueCount      = document.getElementById('queue-count');
 const queueEmpty      = document.getElementById('queue-empty');
 const queueTable      = document.getElementById('queue-table');
@@ -816,6 +818,46 @@ async function skipCurrent() {
 
 if (skipCurrentBtn) skipCurrentBtn.addEventListener('click', skipCurrent);
 
+function renderChannelPause(settings) {
+    channelAudioPaused = settings.paused === true;
+    pauseCurrentBtn.textContent = channelAudioPaused ? '▶ Resume' : '⏸ Pause';
+    pauseCurrentBtn.setAttribute('aria-pressed', String(channelAudioPaused));
+}
+
+async function loadChannelAudioSettings() {
+    const channel = currentChannel;
+    if (!channel) return;
+    try {
+        const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/audio-settings`);
+        if (!res.ok) throw new Error(res.status);
+        const data = await res.json();
+        if (channel !== currentChannel) return;
+        renderChannelPause(data.settings);
+        pauseCurrentBtn.disabled = false;
+    } catch {
+        if (channel === currentChannel) setMyListPlaybackStatus('Could not load saved audio settings.', true);
+    }
+}
+
+pauseCurrentBtn.addEventListener('click', async () => {
+    const channel = currentChannel;
+    if (!channel || pauseCurrentBtn.disabled) return;
+    pauseCurrentBtn.disabled = true;
+    try {
+        const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/audio-settings`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ paused: !channelAudioPaused })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not pause/resume playback.');
+        if (channel === currentChannel) renderChannelPause(data.settings);
+    } catch (err) {
+        if (channel === currentChannel) setMyListPlaybackStatus(err.message, true);
+    } finally {
+        if (channel === currentChannel) pauseCurrentBtn.disabled = false;
+    }
+});
+
 // ── Channel switching ─────────────────────────────────────────────────────────
 
 // The full standalone overlay URL for the current channel (no &controls), used
@@ -827,6 +869,8 @@ function switchChannel(channel) {
     if (socket && currentChannel) socket.emit('leave:channel', currentChannel);
 
     currentChannel = channel;
+    renderChannelPause({ paused: false });
+    pauseCurrentBtn.disabled = true;
     renderLoopButton(false);
     mylistLoopBtn.disabled = true;
     mylistShuffleBtn.disabled = true;
@@ -849,6 +893,7 @@ function switchChannel(channel) {
     if (socket) socket.emit('join:channel', channel);
     loadMedia();
     loadMode();
+    loadChannelAudioSettings();
     loadMyList();
     loadLocalImport();
     if (activeQueueTab === 'local')  { loadLocalFolders(); loadLocalFiles(); }
@@ -942,6 +987,9 @@ async function init() {
         // Promotion consumes or rotates My List, so keep its displayed order
         // and the loop setting in sync across dashboards.
         loadMyList();
+    });
+    socket.on('audio:settings', ({ channel, settings }) => {
+        if (channel === currentChannel) renderChannelPause(settings);
     });
     socket.on('local:import:update', ({ channel, job }) => {
         if (channel !== currentChannel) return;

@@ -26,9 +26,17 @@ const CONTROLS  = params.get('controls') === '1';
 // (timing, volume, seek, and end-of-track all come from it).
 //
 // Append &ytmode=iframe to fall back to the old iframe-audio behaviour if needed.
-const YT_AUDIO_MODE = params.get('ytmode') !== 'iframe';
+let ytAudioProxyEnabled = params.get('ytmode') !== 'iframe';
 const MAX_VOLUME = 0.5; // 100% in the controls is half the previous maximum.
 let volumePercent = 100;
+let audioPaused = false;
+let pendingAudioSettings = {};
+let audioSaveTimer = null;
+let audioSettingsWrite = Promise.resolve();
+let audioSettingsRevision = 0;
+let audioWritesPending = 0;
+let expectedYouTubeState = null;
+let expectedYouTubeUntil = 0;
 let playbackMode = null; // 'youtube-audio', 'youtube', 'local', or 'spotify'
 
 let ytPlayer       = null;   // muted iframe player (video picture only, in audio mode)
@@ -39,6 +47,8 @@ let skipItemId     = null;   // ID of last removed item — skip if it comes bac
 let finishedItemId = null;   // ID of last *finished/empty* item — never replay it
 let ytFallbackTimer = null;
 let currentFetchSequence = 0;
+let currentMediaItem = null;
+let spotifySourceUrl = '';
 
 // ── Background-throttle survival ──────────────────────────────────────────────
 // The native <audio> element keeps playing in a background tab on its own, and a
@@ -94,13 +104,143 @@ document.addEventListener('visibilitychange', () => {
 const idleScreen    = document.getElementById('idle-screen');
 const ytContainer   = document.getElementById('yt-player');
 const spotifyFrame  = document.getElementById('spotify-player');
+const playbackStatus = document.getElementById('playback-status');
+const playbackMessage = document.getElementById('playback-message');
+const playbackRetryBtn = document.getElementById('playback-retry-btn');
+const playbackSkipBtn = document.getElementById('playback-skip-btn');
+const pauseResumeBtn = document.getElementById('pause-resume-btn');
+
+function commandYouTubeState(paused) {
+    if (!ytPlayer) return;
+    expectedYouTubeState = paused ? 2 : 1;
+    expectedYouTubeUntil = Date.now() + 800;
+    if (paused) ytPlayer.pauseVideo();
+    else ytPlayer.playVideo();
+}
+
+function applyAudioSettings(settings, fromYouTube = false) {
+    const wasPaused = audioPaused;
+    if (typeof settings.volume === 'number') applyVolume(settings.volume);
+    if (typeof settings.paused === 'boolean') audioPaused = settings.paused;
+    if (pauseResumeBtn) {
+        pauseResumeBtn.textContent = audioPaused ? '▶ Resume' : '⏸ Pause';
+        pauseResumeBtn.setAttribute('aria-pressed', String(audioPaused));
+    }
+    if (audioPaused) {
+        audioEl.pause();
+        stopPoll();
+        stopWatchdog();
+        if (!wasPaused && !fromYouTube) commandYouTubeState(true);
+        if (playbackMode === 'spotify') spotifyFrame.src = 'about:blank';
+    } else if (wasPaused) {
+        if (usesNativeAudio() && audioEl.src) startNativeAudio();
+        if (!fromYouTube) commandYouTubeState(false);
+        startPoll();
+        if (playbackMode === 'youtube') startWatchdog();
+        if (playbackMode === 'spotify') spotifyFrame.src = spotifySourceUrl;
+    }
+}
+
+async function loadSavedAudioSettings() {
+    if (!CHANNEL) return;
+    try {
+        const res = await fetch(`/api/channels/${encodeURIComponent(CHANNEL)}/audio-settings`);
+        if (!res.ok) throw new Error(res.status);
+        const data = await res.json();
+        if (!audioWritesPending && !Object.keys(pendingAudioSettings).length) applyAudioSettings(data.settings);
+    } catch {
+        showPlaybackMessage('Saved audio settings could not be loaded. Check the server update and retry.');
+    }
+}
+
+function flushAudioSettings() {
+    clearTimeout(audioSaveTimer);
+    audioSaveTimer = null;
+    if (!CHANNEL || !Object.keys(pendingAudioSettings).length) return audioSettingsWrite;
+    const update = pendingAudioSettings;
+    pendingAudioSettings = {};
+    const revision = ++audioSettingsRevision;
+    audioWritesPending++;
+    audioSettingsWrite = audioSettingsWrite.catch(() => {}).then(async () => {
+        const res = await fetch(`/api/channels/${encodeURIComponent(CHANNEL)}/audio-settings`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(update), keepalive: true
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(res.status === 401
+            ? 'Sign in to the dashboard to save audio settings.' : data.error || 'Could not save audio settings.');
+        if (revision === audioSettingsRevision && !Object.keys(pendingAudioSettings).length)
+            applyAudioSettings(data.settings);
+    }).catch(err => {
+        if (revision === audioSettingsRevision) showPlaybackMessage(err.message, true);
+    }).finally(() => { audioWritesPending--; });
+    return audioSettingsWrite;
+}
+
+function saveAudioSettings(update, immediate = false) {
+    pendingAudioSettings = { ...pendingAudioSettings, ...update };
+    clearTimeout(audioSaveTimer);
+    if (immediate) return flushAudioSettings();
+    audioSaveTimer = setTimeout(flushAudioSettings, 250);
+}
+
+function setAudioPaused(paused, persist = true, fromYouTube = false) {
+    applyAudioSettings({ paused }, fromYouTube);
+    if (persist) return saveAudioSettings({ paused }, true);
+}
+
+function showPlaybackMessage(message, error = false) {
+    playbackStatus.hidden = !message || (!error && !CONTROLS);
+    playbackMessage.textContent = message;
+}
+
+function nativeAudioFailed() {
+    if (!currentMediaItem || !usesNativeAudio()) return;
+    const videoId = getYouTubeId(currentMediaItem.url || currentMediaItem.media || '');
+    if (playbackMode === 'youtube-audio' && videoId) {
+        // A proxy 502 is a playback failure, never an instruction to consume
+        // the song. Use YouTube's own player for this session instead.
+        ytAudioProxyEnabled = false;
+        stopAudio();
+        destroyYouTubePlayer();
+        showPlaybackMessage('Audio stream unavailable. Trying the YouTube player…');
+        playYouTube(videoId);
+    } else {
+        stopAudio();
+        showPlaybackMessage('This MP3 could not be loaded. Retry playback or skip this song.', true);
+    }
+}
+
+function startNativeAudio() {
+    if (audioPaused) { audioEl.pause(); return; }
+    const requestedId = currentItemId;
+    const failed = err => {
+        if (requestedId !== currentItemId || !usesNativeAudio() || err?.name === 'AbortError') return;
+        if (err?.name === 'NotAllowedError') {
+            showPlaybackMessage('Click Play / Retry to allow audio playback.', true);
+        } else {
+            nativeAudioFailed();
+        }
+    };
+    try {
+        const pending = audioEl.play();
+        if (pending?.catch) pending.catch(failed);
+    } catch (err) { failed(err); }
+}
+
+playbackRetryBtn.addEventListener('click', () => {
+    const item = currentMediaItem;
+    if (!item) return;
+    currentItemId = null;
+    playItem(item);
+});
+playbackSkipBtn.addEventListener('click', () => advance());
 
 // Hidden same-origin audio element — the playback authority in audio mode.
 // Created once and reused. It is never removed, so the browser keeps it alive in
 // the background.
 const audioEl = new Audio();
 audioEl.preload  = 'auto';
-audioEl.autoplay = true;
+audioEl.autoplay = false;
 audioEl.volume   = MAX_VOLUME;
 
 // ── Audio normalisation ───────────────────────────────────────────────────────
@@ -122,6 +262,7 @@ const seekBar     = CONTROLS ? document.getElementById('seek-bar')        : null
 const volumeBar   = CONTROLS ? document.getElementById('volume-bar')      : null;
 const volumeInput = CONTROLS ? document.getElementById('volume-percent')  : null;
 const timeDisplay = CONTROLS ? document.getElementById('time-display')    : null;
+if (pauseResumeBtn) pauseResumeBtn.addEventListener('click', () => setAudioPaused(!audioPaused));
 
 function formatTime(sec) {
     sec = Number.isFinite(sec) ? Math.max(0, Math.floor(sec)) : 0;
@@ -220,25 +361,27 @@ if (CONTROLS) {
         }
     });
 
-    volumeBar.addEventListener('input', () => applyVolume(volumeBar.value));
+    volumeBar.addEventListener('input', () => { applyVolume(volumeBar.value); saveAudioSettings({ volume: volumePercent }); });
+    volumeBar.addEventListener('change', () => saveAudioSettings({ volume: volumePercent }, true));
     volumeInput.addEventListener('input', () => {
         // Leave an empty field editable while the user replaces its value.
-        if (volumeInput.value !== '') applyVolume(volumeInput.value);
+        if (volumeInput.value !== '') { applyVolume(volumeInput.value); saveAudioSettings({ volume: volumePercent }); }
     });
-    volumeInput.addEventListener('change', () => applyVolume(
-        volumeInput.value === '' ? volumePercent : volumeInput.value
-    ));
+    volumeInput.addEventListener('change', () => {
+        applyVolume(volumeInput.value === '' ? volumePercent : volumeInput.value);
+        saveAudioSettings({ volume: volumePercent }, true);
+    });
     applyVolume();
 }
 
-audioEl.addEventListener('ended', () => { advance(); });
+audioEl.addEventListener('ended', () => { if (usesNativeAudio() && !audioPaused) advance(); });
 audioEl.addEventListener('error', () => {
-    if (!audioEl.src) return;
-    console.error('Audio element error, advancing.');
-    advance();
+    if (!audioEl.src || !usesNativeAudio()) return;
+    nativeAudioFailed();
 });
 audioEl.addEventListener('playing', () => {
-    if (usesNativeAudio()) startPoll();
+    if (audioPaused) { audioEl.pause(); return; }
+    if (usesNativeAudio()) { showPlaybackMessage(''); startPoll(); }
 });
 ['timeupdate', 'durationchange', 'loadedmetadata', 'seeked'].forEach(event =>
     audioEl.addEventListener(event, updateProgress));
@@ -251,9 +394,9 @@ function clearYouTubeFallbackTimer() {
 }
 
 function fallbackEmbed(videoId) {
-    // Use enablejsapi=1 so we can still drive seek/volume from the controls.
     const origin = encodeURIComponent(window.location.origin);
-    const src = `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?enablejsapi=1&autoplay=1&mute=1&controls=0&rel=0&modestbranding=1&playsinline=1&origin=${origin}`;
+    const mute = playbackMode === 'youtube-audio' ? 1 : 0;
+    const src = `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?enablejsapi=1&autoplay=${audioPaused ? 0 : 1}&mute=${mute}&controls=1&rel=0&playsinline=1&origin=${origin}`;
     ytContainer.innerHTML = `
         <iframe
             id="yt-fallback-iframe"
@@ -267,44 +410,8 @@ function fallbackEmbed(videoId) {
             referrerpolicy="strict-origin-when-cross-origin">
         </iframe>`;
 
-    // If the JS API is (or becomes) available, attach a player to the fallback
-    // iframe so the seek/volume sliders keep working instead of silently dying.
-    const attach = () => {
-        if (typeof YT === 'undefined' || !YT.Player) return false;
-        try {
-            ytPlayer = new YT.Player('yt-fallback-iframe', {
-                events: {
-                    onReady(event) {
-                        if (YT_AUDIO_MODE) {
-                            // Video picture only — never let the iframe make sound.
-                            event.target.mute();
-                        } else {
-                            applyVolume(volumePercent, event.target);
-                            startPoll();
-                            startWatchdog();
-                        }
-                    },
-                    onStateChange(event) {
-                        if (YT_AUDIO_MODE) return;   // audio element drives advance()
-                        if (event.data === YT.PlayerState.ENDED) advance();
-                        if (CONTROLS) {
-                            if (event.data === YT.PlayerState.PLAYING) startPoll();
-                            else if (event.data === YT.PlayerState.PAUSED ||
-                                     event.data === YT.PlayerState.ENDED)  stopPoll();
-                        }
-                    }
-                }
-            });
-            return true;
-        } catch { return false; }
-    };
-    if (!attach()) {
-        // YT script not parsed yet — retry briefly.
-        let tries = 0;
-        const t = setInterval(() => {
-            if (attach() || ++tries > 20) clearInterval(t);
-        }, 250);
-    }
+    // Do not attach the API to an iframe that is still about:blank. When the
+    // API arrives it creates a fresh mounted player, avoiding origin races.
 }
 
 function scheduleFallback(videoId) {
@@ -319,7 +426,7 @@ function scheduleFallback(videoId) {
 // In audio mode the <audio> 'ended' event is reliable in the background, so the
 // watchdog is not used. It remains for the legacy iframe-audio mode.
 function startWatchdog() {
-    if (YT_AUDIO_MODE) return;
+    if (playbackMode !== 'youtube' || audioPaused) return;
     if (watchdogTimer) return;
     watchdogTimer = setInterval(() => {
         if (advancing || !ytPlayer) return;
@@ -379,9 +486,10 @@ function destroyYouTubePlayer() {
         try { ytPlayer.destroy(); } catch {}
     }
     ytPlayer = null;
+    expectedYouTubeState = null;
     pendingVideoId = null;
-    // Re-create the target div the API needs (destroy() removes it).
-    ytContainer.innerHTML = '';
+    // The API replaces only this child. The outer container stays in the DOM.
+    ytContainer.innerHTML = '<div id="yt-player-mount"></div>';
 }
 
 // Stop and clear the audio element (without removing it from the DOM/memory).
@@ -404,142 +512,92 @@ function showIdle() {
     destroyYouTubePlayer();          // clear completely — no lingering replayable video
     stopAudio();
     currentItemId = null;
+    currentMediaItem = null;
+    showPlaybackMessage('');
     stopPoll();
     stopWatchdog();
     if (CONTROLS && seekBar)     { seekBar.value = 0; seekBar.disabled = false; }
     if (CONTROLS && timeDisplay) timeDisplay.textContent = '0:00 / 0:00';
 }
 
-// Audio-mode YouTube playback: native <audio> drives sound + timing; the muted
-// iframe (if the API is ready) just shows the picture.
-function playYouTubeAudioMode(videoId) {
-    playbackMode = 'youtube-audio';
-    isSeeking = false;
-    idleScreen.style.display   = 'none';
-    spotifyFrame.style.display = 'none';
-    ytContainer.style.display  = 'block';
-
-    if (CONTROLS && seekBar)     { seekBar.value = 0; seekBar.disabled = false; }
-    if (CONTROLS && timeDisplay) timeDisplay.textContent = '0:00 / 0:00';
-
-    // 1) Start the audio (the part that must survive a background tab).
-    audioEl.src = `/api/yt-audio/${encodeURIComponent(videoId)}`;
-    applyVolume();
-    const p = audioEl.play();
-    if (p && p.catch) {
-        p.catch(err => {
-            // Autoplay may be blocked until a user gesture (first load in a fresh
-            // window). The pointerdown handler below retries; log for visibility.
-            console.warn('Audio autoplay blocked — click once to start.', err?.message || err);
-        });
-    }
-    if (CONTROLS) startPoll();
-
-    // 2) Show the muted video picture via the iframe, best-effort.
+// Keep the video picture separate from native audio startup. A late YouTube
+// API callback must not restart the audio or detach the active iframe.
+function showYouTubePlayer(videoId) {
     if (!ytApiReady) {
         pendingVideoId = videoId;
         scheduleFallback(videoId);
         return;
     }
     clearYouTubeFallbackTimer();
-    ytContainer.innerHTML = '';
+    const itemId = currentItemId;
     if (!ytPlayer) {
-        ytPlayer = new YT.Player('yt-player', {
-            width:  '100%',
-            height: '100%',
-            videoId,
+        ytContainer.innerHTML = '<div id="yt-player-mount"></div>';
+        ytPlayer = new YT.Player('yt-player-mount', {
+            width: '100%', height: '100%', videoId,
             playerVars: {
-                autoplay: 1, playsinline: 1, controls: 0, rel: 0,
-                modestbranding: 1, enablejsapi: 1, mute: 1,
-                origin: window.location.origin
+                autoplay: audioPaused ? 0 : 1, playsinline: 1, controls: 1, rel: 0,
+                enablejsapi: 1, mute: 1, origin: window.location.origin
             },
             events: {
                 onReady(event) {
-                    event.target.mute();          // picture only — no second audio
-                    event.target.playVideo();
-                },
-                onStateChange() { /* audio element drives advance() */ },
-                onError() { /* picture failing is non-fatal in audio mode */ }
-            }
-        });
-    } else {
-        ytPlayer.loadVideoById(videoId);
-        ytPlayer.mute();
-        ytPlayer.playVideo();
-    }
-}
-
-function playYouTube(videoId) {
-    if (YT_AUDIO_MODE) { playYouTubeAudioMode(videoId); return; }
-    playbackMode = 'youtube';
-    isSeeking = false;
-
-    // ── Legacy iframe-audio mode (&ytmode=iframe) ──
-    idleScreen.style.display   = 'none';
-    spotifyFrame.style.display = 'none';
-    ytContainer.style.display  = 'block';
-    stopAudio();
-    stopPoll();
-    if (CONTROLS && seekBar)     { seekBar.value = 0; seekBar.disabled = false; }
-    if (CONTROLS && timeDisplay) timeDisplay.textContent = '0:00 / 0:00';
-
-    const fallbackIframe = ytContainer.querySelector('iframe[data-fallback="1"]');
-    if (fallbackIframe && !ytApiReady) {
-        fallbackEmbed(videoId);
-        return;
-    }
-
-    if (!ytApiReady) {
-        pendingVideoId = videoId;
-        scheduleFallback(videoId);
-        return;
-    }
-
-    clearYouTubeFallbackTimer();
-    ytContainer.innerHTML = '';
-
-    if (!ytPlayer) {
-        ytPlayer = new YT.Player('yt-player', {
-            width:  '100%',
-            height: '100%',
-            videoId,
-            playerVars: {
-                autoplay:       1,
-                mute:           1,
-                playsinline:    1,
-                controls:       0,
-                rel:            0,
-                modestbranding: 1,
-                enablejsapi:    1,
-                origin:         window.location.origin
-            },
-            events: {
-                onReady(event) {
-                    applyVolume(volumePercent, event.target);
-                    event.target.playVideo();
-                    startPoll();
-                    startWatchdog();
+                    if (event.target !== ytPlayer || itemId !== currentItemId) return;
+                    if (playbackMode === 'youtube-audio') event.target.mute();
+                    else applyVolume(volumePercent, event.target);
+                    commandYouTubeState(audioPaused);
+                    if (playbackMode === 'youtube' && !audioPaused) { startPoll(); startWatchdog(); }
                 },
                 onStateChange(event) {
-                    if (event.data === YT.PlayerState.ENDED) advance();
-                    if (CONTROLS) {
-                        if (event.data === YT.PlayerState.PLAYING) startPoll();
-                        else if (event.data === YT.PlayerState.PAUSED ||
-                                 event.data === YT.PlayerState.ENDED)  stopPoll();
-                    }
+                    if (event.target !== ytPlayer || itemId !== currentItemId) return;
+                    const expected = event.data === expectedYouTubeState;
+                    const commanded = expected || (expectedYouTubeState !== null && Date.now() < expectedYouTubeUntil);
+                    if (expected || Date.now() >= expectedYouTubeUntil) expectedYouTubeState = null;
+                    // Clicking Pause on the muted video picture must pause its
+                    // native audio too. Apply the same change to other players.
+                    if (!commanded && event.data === YT.PlayerState.PAUSED && !audioPaused) setAudioPaused(true, true, true);
+                    if (!commanded && event.data === YT.PlayerState.PLAYING && audioPaused) setAudioPaused(false, true, true);
+                    if (playbackMode !== 'youtube') return;
+                    if (event.data === YT.PlayerState.ENDED && !audioPaused) { advance(); return; }
+                    if (event.data === YT.PlayerState.PLAYING) {
+                        showPlaybackMessage('');
+                        startPoll();
+                    } else if (event.data === YT.PlayerState.PAUSED) stopPoll();
                 },
-                onError() {
-                    console.error('YouTube player error, advancing.');
-                    advance();
+                onError(event) {
+                    if (event.target !== ytPlayer || itemId !== currentItemId || playbackMode !== 'youtube') return;
+                    showPlaybackMessage('YouTube could not play this video. Retry playback or skip this song.', true);
+                },
+                onAutoplayBlocked() {
+                    if (itemId === currentItemId && playbackMode === 'youtube')
+                        showPlaybackMessage('Click Play / Retry to allow YouTube playback.', true);
                 }
             }
         });
     } else {
         ytPlayer.loadVideoById(videoId);
-        applyVolume();
-        ytPlayer.playVideo();
-        startPoll();
+        if (playbackMode === 'youtube-audio') ytPlayer.mute();
+        else applyVolume();
+        commandYouTubeState(audioPaused);
     }
+}
+
+function playYouTube(videoId) {
+    playbackMode = ytAudioProxyEnabled ? 'youtube-audio' : 'youtube';
+    isSeeking = false;
+    idleScreen.style.display = 'none';
+    spotifyFrame.style.display = 'none';
+    ytContainer.style.display = 'block';
+    if (CONTROLS && seekBar) { seekBar.value = 0; seekBar.disabled = false; }
+    if (CONTROLS && timeDisplay) timeDisplay.textContent = '0:00 / 0:00';
+    if (ytAudioProxyEnabled) {
+        audioEl.src = `/api/yt-audio/${encodeURIComponent(videoId)}`;
+        applyVolume();
+        startNativeAudio();
+        if (CONTROLS) startPoll();
+    } else {
+        stopAudio();
+        stopPoll();
+    }
+    showYouTubePlayer(videoId);
 }
 
 function playSpotify(info) {
@@ -555,8 +613,8 @@ function playSpotify(info) {
     if (CONTROLS && seekBar)     { seekBar.value = 0; seekBar.disabled = true; }
     if (CONTROLS && timeDisplay) timeDisplay.textContent = 'Spotify';
 
-    spotifyFrame.src =
-        `https://open.spotify.com/embed/${info.type}/${info.id}?utm_source=generator&autoplay=1`;
+    spotifySourceUrl = `https://open.spotify.com/embed/${info.type}/${info.id}?utm_source=generator&autoplay=1`;
+    spotifyFrame.src = audioPaused ? 'about:blank' : spotifySourceUrl;
 }
 
 // Play a local MP3 file through the native <audio> element.
@@ -579,10 +637,7 @@ function playLocalAudio(item) {
     // Route through the normalised audio element.
     audioEl.src = url;
     applyVolume();
-    const p = audioEl.play();
-    if (p && p.catch) {
-        p.catch(err => console.warn('Local audio autoplay blocked:', err?.message || err));
-    }
+    startNativeAudio();
     if (CONTROLS) startPoll();
 }
 
@@ -597,8 +652,14 @@ function playItem(item) {
     if (id === currentItemId) return;   // already playing this
     if (id === skipItemId) { showIdle(); return; }  // just removed — API hasn't updated yet
     if (id === finishedItemId) { showIdle(); return; }  // finished song lingering in API — don't replay
-    skipItemId    = null;
+    stopAudio();
+    destroyYouTubePlayer();
+    stopPoll();
+    stopWatchdog();
+    showPlaybackMessage('');
+    skipItemId = null;
     currentItemId = id;
+    currentMediaItem = item;
 
     if (platform === 'spotify' || getSpotifyInfo(url)) {
         const info = getSpotifyInfo(url);
@@ -618,8 +679,7 @@ function playItem(item) {
     const ytId = getYouTubeId(url);
     if (ytId) { playYouTube(ytId); return; }
 
-    console.warn('Unrecognised media URL, skipping:', url);
-    advance();
+    showPlaybackMessage('This media link cannot be played. Retry playback or skip this song.', true);
 }
 
 // ── YouTube IFrame API callback (called by the API script) ────────────────────
@@ -630,7 +690,7 @@ window.onYouTubeIframeAPIReady = function () {
     if (pendingVideoId) {
         const id   = pendingVideoId;
         pendingVideoId = null;
-        playYouTube(id);
+        showYouTubePlayer(id);
     }
 };
 
@@ -640,7 +700,7 @@ window.onYouTubeIframeAPIReady = function () {
 ['click', 'keydown', 'touchstart', 'pointerdown'].forEach(ev =>
     window.addEventListener(ev, () => {
         if (usesNativeAudio() && audioEl.src && audioEl.paused) {
-            audioEl.play().catch(() => {});
+            startNativeAudio();
         }
     }, { passive: true }));
 
@@ -671,11 +731,16 @@ if (CHANNEL) {
 
     socket.on('connect', () => {
         socket.emit('join:channel', CHANNEL);
+        loadSavedAudioSettings();
     });
 
     socket.on('queue:update', (payload = {}) => {
         if (payload.channel && payload.channel !== CHANNEL) return;
         fetchAndPlay();
+    });
+    socket.on('audio:settings', ({ channel, settings }) => {
+        if (channel !== CHANNEL || audioWritesPending || Object.keys(pendingAudioSettings).length) return;
+        applyAudioSettings(settings);
     });
 
     // Safety re-sync: if a queue:update socket message is ever missed (e.g. while
@@ -683,11 +748,16 @@ if (CHANNEL) {
     // re-checks the current item so the overlay self-heals. playItem() is a no-op
     // when the current item is already playing, so this is cheap.
     setInterval(() => {
-        if (!advancing) fetchAndPlay();
+        if (!advancing) { fetchAndPlay(); loadSavedAudioSettings(); }
     }, 10000);
 
     // Reduce background throttling while the overlay is open (best-effort).
     requestWakeLock();
 }
 
-fetchAndPlay();
+async function initOverlay() {
+    await loadSavedAudioSettings();
+    await fetchAndPlay();
+}
+
+initOverlay();
