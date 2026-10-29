@@ -12,12 +12,15 @@ const multer   = require('multer');
 const WebSocket = require('ws');
 const { Server } = require('socket.io');
 const { createPlaylistImporter } = require('./playlist-imports');
+const { createMusicLibrary } = require('./music-library');
 const { createAudioSettings } = require('./audio-settings');
 const { FileSessionStore, persistentSessionSecret, REMEMBER_LOGIN_MS } = require('./session-store');
 
 const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server);
+const LOCAL_MEDIA_ROOT = process.env.LOCAL_MEDIA_ROOT || path.join(__dirname, '../..', 'data', 'local-media');
+const musicLibrary = createMusicLibrary(path.join(LOCAL_MEDIA_ROOT, '.library'));
 const audioSettings = createAudioSettings(process.env.AUDIO_SETTINGS_ROOT || path.join(__dirname, '../..', 'data', 'audio-settings'));
 const sessionDirectory = process.env.SESSION_STORE_ROOT || path.join(__dirname, '../..', 'data', 'sessions');
 const sessionSecret = process.env.SESSION_SECRET || persistentSessionSecret(sessionDirectory);
@@ -50,7 +53,7 @@ function emitQueueUpdate(channel, media = []) {
 
 async function fetchChannelMedia(channel) {
     const data = await bastiGet(`/getallmedia/${encodeURIComponent(channel)}`);
-    return Array.isArray(data?.media) ? data.media : [];
+    return Array.isArray(data?.media) ? data.media.map(item => decorateOwnerSong(channel, item)) : [];
 }
 
 async function pollChannelOnce(channel) {
@@ -271,17 +274,16 @@ function hasAccess(user, channel, accounts = loadAccounts()) {
     return viewers.has(normalizeIdentifier(user.channel)) || viewers.has(normalizeIdentifier(user.username));
 }
 
-// ── Personal list + play-mode (in-memory, per channel) ───────────────────────────
+// ── Personal list (persisted) + play-mode (per channel) ───────────────────────────
 
-// mylistByChannel: channel -> media items in upcoming playback order
-const mylistByChannel = new Map();
 // Loop applies only to My List; viewer requests are always consumed once.
 const modeByChannel   = new Map();
 const promotedMyListByChannel = new Map();
+const personalListWaitByChannel = new Map();
+const retiredMyListSongs = new WeakSet();
 
 function getMyList(channel) {
-    if (!mylistByChannel.has(channel)) mylistByChannel.set(channel, []);
-    return mylistByChannel.get(channel);
+    return musicLibrary.queue(channel);
 }
 
 function getMode(channel) {
@@ -293,9 +295,13 @@ function getMode(channel) {
 
 // Keep loadChannelMyList / saveChannelMyList as thin wrappers so existing call-sites stay untouched
 function loadChannelMyList(channel) { return { items: getMyList(channel) }; }
-function saveChannelMyList(channel, data) { mylistByChannel.set(channel, data.items || []); }
+function saveChannelMyList(channel, data) { musicLibrary.setQueue(channel, data.items || []); }
 
-function clearChannelMyList(channel) { getMyList(channel).length = 0; }
+function clearChannelMyList(channel) {
+    const playing = promotedMyListByChannel.get(channel);
+    if (playing) retiredMyListSongs.add(playing);
+    saveChannelMyList(channel, { items: [] });
+}
 
 
 function loadChannelMode(channel) { return getMode(channel); }
@@ -363,165 +369,6 @@ async function resolveYouTubeVideoTitle(videoId) {
     } catch { return null; }
 }
 
-async function expandYouTubePlaylistViaScrape(playlistId) {
-    try {
-        const r = await fetch(
-            `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`,
-            {
-                headers: {
-                    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                    'Accept-Language': 'en-US,en;q=0.9'
-                }
-            }
-        );
-        if (!r.ok) { console.warn(`Playlist scrape HTTP ${r.status} for ${playlistId}`); return null; }
-        const html = await r.text();
-
-        // ── Step 1: extract ytInitialData JSON by counting braces ────────────
-        const marker   = 'var ytInitialData = ';
-        const startIdx = html.indexOf(marker);
-        if (startIdx === -1) { console.warn('ytInitialData marker not found'); return null; }
-
-        const jsonStart = startIdx + marker.length;
-        let depth = 0, inString = false, escape = false, end = -1;
-        for (let i = jsonStart; i < html.length; i++) {
-            const c = html[i];
-            if (escape)               { escape = false; continue; }
-            if (c === '\\' && inString) { escape = true;  continue; }
-            if (c === '"')              { inString = !inString; continue; }
-            if (inString)               continue;
-            if (c === '{') depth++;
-            else if (c === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
-        }
-        if (end === -1) { console.warn('Could not find end of ytInitialData JSON'); return null; }
-
-        let parsed;
-        try { parsed = JSON.parse(html.slice(jsonStart, end)); }
-        catch (e) { console.warn('ytInitialData JSON parse failed:', e.message); return null; }
-
-        // ── Step 2: walk the entire tree looking for playlistVideoRenderer ───
-        const now   = new Date().toISOString();
-        const items = [];
-        const seen  = new Set();
-
-        function walk(obj) {
-            if (!obj || typeof obj !== 'object') return;
-            if (Array.isArray(obj)) { obj.forEach(walk); return; }
-
-            const v = obj.playlistVideoRenderer;
-            if (v?.videoId && !seen.has(v.videoId)) {
-                seen.add(v.videoId);
-                const title = v.title?.runs?.[0]?.text
-                           || v.title?.simpleText
-                           || 'Unknown Title';
-                items.push({ url: `https://www.youtube.com/watch?v=${v.videoId}`, title, platform: 'youtube', addedAt: now });
-                return; // no need to descend further into this renderer
-            }
-            for (const val of Object.values(obj)) walk(val);
-        }
-
-        walk(parsed);
-
-        // ── Step 3: regex backstop ───────────────────────────────────────────
-        // ytInitialData sometimes only contains the first ~100 lazy-loaded
-        // entries, or YouTube changes the renderer shape. Sweep the raw HTML for
-        // any "videoId":"..." tokens we haven't already captured so long
-        // playlists aren't silently truncated.
-        const idRegex = /"videoId":"([A-Za-z0-9_-]{11})"/g;
-        let rm;
-        while ((rm = idRegex.exec(html)) !== null) {
-            const vid = rm[1];
-            if (seen.has(vid)) continue;
-            seen.add(vid);
-            items.push({ url: `https://www.youtube.com/watch?v=${vid}`, title: 'Unknown Title', platform: 'youtube', addedAt: now });
-        }
-
-        console.log(`Scraped ${items.length} videos from playlist ${playlistId}`);
-        return items.length > 0 ? items : null;
-    } catch (e) { console.error('Playlist scrape error:', e.message); return null; }
-}
-
-async function expandYouTubePlaylistViaYtDlp(playlistId) {
-    return new Promise((resolve, reject) => {
-        // --flat-playlist: only list videos, don't resolve each one (fast).
-        // --print id:     output just the video ID on each line.
-        // --no-playlist:  ensure a bare ID isn't treated as a playlist.
-        execFile(
-            'yt-dlp',
-            [
-                '--flat-playlist',
-                '--print', 'id',
-                '--no-playlist',
-                '--no-warnings',
-                `https://www.youtube.com/playlist?list=${playlistId}`
-            ],
-            { timeout: 60000, maxBuffer: 10 * 1024 * 1024 },
-            (err, stdout, stderr) => {
-                if (err) return reject(new Error(String(stderr || err.message).trim()));
-                const ids = String(stdout).trim().split(/\r?\n/).filter(id => /^[A-Za-z0-9_-]{11}$/.test(id));
-                if (ids.length === 0) return reject(new Error('yt-dlp returned no video IDs'));
-                const now = new Date().toISOString();
-                const items = ids.map(id => ({
-                    url:      `https://www.youtube.com/watch?v=${id}`,
-                    title:    'Unknown Title',
-                    platform: 'youtube',
-                    addedAt:  now
-                }));
-                console.log(`yt-dlp resolved ${items.length} videos from playlist ${playlistId}`);
-                resolve(items);
-            }
-        );
-    });
-}
-
-async function expandYouTubePlaylist(playlistId) {
-    const apiKey = process.env.YOUTUBE_API_KEY;
-
-    if (apiKey) {
-        // Full expansion via YouTube Data API v3 (up to 2000 items)
-        const items = [];
-        let pageToken = '';
-        let pages = 0;
-        do {
-            let url = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId=${encodeURIComponent(playlistId)}&key=${encodeURIComponent(apiKey)}`;
-            if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
-            const r = await fetch(url);
-            const data = await r.json().catch(() => ({}));
-            if (!r.ok || data.error) {
-                const reason = data?.error?.errors?.[0]?.reason || data?.error?.message || `HTTP ${r.status}`;
-                console.error(`YouTube Data API failed for playlist ${playlistId}: ${reason}`);
-                console.error('  → Check: key is correct, "YouTube Data API v3" is ENABLED, and quota is not exhausted.');
-                break;
-            }
-            for (const item of (data.items || [])) {
-                const videoId = item.snippet?.resourceId?.videoId;
-                const title   = item.snippet?.title;
-                if (videoId && title !== 'Deleted video' && title !== 'Private video') {
-                    items.push({
-                        url:      `https://www.youtube.com/watch?v=${videoId}`,
-                        title:    title || 'Unknown Title',
-                        platform: 'youtube',
-                        addedAt:  new Date().toISOString()
-                    });
-                }
-            }
-            pageToken = data.nextPageToken || '';
-            pages++;
-        } while (pageToken && pages < 40);
-        if (items.length > 0) return items;
-    }
-
-    // Fallback 1: yt-dlp --flat-playlist (no key needed, handles any size)
-    try {
-        const items = await expandYouTubePlaylistViaYtDlp(playlistId);
-        if (items && items.length > 0) return items;
-    } catch (e) {
-        console.warn(`yt-dlp playlist fallback failed for ${playlistId}:`, e.message || e);
-    }
-
-    // Fallback 2: scrape the YouTube playlist page (last resort)
-    return expandYouTubePlaylistViaScrape(playlistId);
-}
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
@@ -636,7 +483,7 @@ app.get('/api/media/:owner', requireAuth, async (req, res) => {
         const cleaned = media.filter((item, i) =>
             i === 0 || !isOwnerSong(item, req.params.owner)
         );
-        res.json({ ...data, media: cleaned });
+        res.json({ ...data, media: cleaned.map(item => decorateOwnerSong(req.params.owner, item)) });
     } catch {
         res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
     }
@@ -650,6 +497,7 @@ app.post('/api/media/:owner/remove/:index', requireAuth, async (req, res) => {
         const data = await bastiPost(`/removemedia/${req.params.owner}/${req.params.index}`);
         if (req.params.index === '0') {
             playbackByChannel.delete(req.params.owner);
+            personalListWaitByChannel.delete(req.params.owner);
             promotedMyListByChannel.delete(req.params.owner);
         }
         io.to(`ch:${req.params.owner}`).emit('queue:update', { channel: req.params.owner });
@@ -662,7 +510,7 @@ app.post('/api/media/:owner/remove/:index', requireAuth, async (req, res) => {
 // Push an OWNER song to the FRONT of the Basti queue (used when a My List song
 // becomes current). Calls Basti's /setmediatop route, which mirrors /setmedia
 // but inserts at index 0. The owner marker is the username (US<channel>); Basti
-// also tags it owner_song: true. Note Basti resolves the title itself.
+// also tags it owner_song: true. Send our title, especially for uploaded files.
 async function pushOwnerSongToBasti(channel, item) {
     const rawUrl = item?.url || item?.media || '';
     const user   = ownerUsernameFor(channel);   // US<channel> marks it as an owner song
@@ -678,7 +526,10 @@ async function pushOwnerSongToBasti(channel, item) {
     }
 
     const encodedMedia = encodeURIComponent(media);
-    return bastiPost(`/setmediatop/${encodeURIComponent(channel)}/${encodeURIComponent(user)}/${encodedMedia}`);
+    const metadata = new URLSearchParams();
+    if (item.title || item.song_name) metadata.set('song_name', item.title || item.song_name);
+    if (item.platform) metadata.set('platform', item.platform);
+    return bastiPost(`/setmediatop/${encodeURIComponent(channel)}/${encodeURIComponent(user)}/${encodedMedia}?${metadata}`);
 }
 
 // ── Personal list (stored locally per channel) ────────────────────────────────
@@ -697,63 +548,31 @@ app.post('/api/mylist/:owner/add', requireAuth, async (req, res) => {
     if (!url || typeof url !== 'string' || !url.trim())
         return res.status(400).json({ error: 'URL required.' });
 
-    const rawUrl    = url.trim();
-    const data      = loadChannelMyList(req.params.owner);
-    const added     = [];
-    let   warning   = null;
-    const now       = new Date().toISOString();
+    const rawUrl = url.trim();
+    const added = [];
+    const now = new Date().toISOString();
     const playlistId = parseYouTubePlaylistId(rawUrl);
-
     if (playlistId) {
-        // Any YouTube URL with an expandable list= param → try the full playlist
-        const expanded = await expandYouTubePlaylist(playlistId);
-        if (expanded && expanded.length > 0) {
-            data.items.push(...expanded);
-            added.push(...expanded);
-        } else {
-            // Expansion failed (private/unavailable, or API+scrape both down).
-            // If the URL also pointed at a specific video, add THAT single video
-            // so the user at least gets the one they selected — never a dead stub.
-            const videoId = parseYouTubeVideoId(rawUrl);
-            if (videoId) {
-                const title = await resolveYouTubeVideoTitle(videoId) || 'Unknown Title';
-                const entry = { url: `https://www.youtube.com/watch?v=${videoId}`, title, platform: 'youtube', addedAt: now };
-                data.items.push(entry);
-                added.push(entry);
-                warning = 'Could not expand the playlist (add a YOUTUBE_API_KEY for reliable import) — added the single selected video instead.';
-            } else {
-                const entry = {
-                    url:        rawUrl,
-                    title:      `YouTube Playlist (${playlistId})`,
-                    platform:   'youtube-playlist',
-                    playlistId,
-                    addedAt:    now
-                };
-                data.items.push(entry);
-                added.push(entry);
-                warning = 'Could not expand the playlist — stored as a link only.';
-            }
-        }
-    } else {
-        const videoId = parseYouTubeVideoId(rawUrl);
-        if (videoId) {
-            const title = await resolveYouTubeVideoTitle(videoId) || 'Unknown Title';
-            const entry = { url: rawUrl, title, platform: 'youtube', addedAt: now };
-            data.items.push(entry);
-            added.push(entry);
-        } else if (rawUrl.includes('spotify.com')) {
-            const entry = { url: rawUrl, title: 'Spotify Track', platform: 'spotify', addedAt: now };
-            data.items.push(entry);
-            added.push(entry);
-        } else {
-            const entry = { url: rawUrl, title: rawUrl, platform: 'other', addedAt: now };
-            data.items.push(entry);
-            added.push(entry);
+        try {
+            const job = playlistImporter.start(req.params.owner, { url: rawUrl });
+            return res.status(202).json({ success: true, job });
+        } catch (err) {
+            return res.status(err.status || 500).json({ error: err.message });
         }
     }
-
+    const videoId = parseYouTubeVideoId(rawUrl);
+    if (videoId) {
+        const title = await resolveYouTubeVideoTitle(videoId) || `YouTube video (${videoId})`;
+        added.push({ url: rawUrl, title, platform: 'youtube', addedAt: now });
+    } else if (rawUrl.includes('spotify.com')) {
+        added.push({ url: rawUrl, title: 'Spotify Track', platform: 'spotify', addedAt: now });
+    } else {
+        added.push({ url: rawUrl, title: rawUrl, platform: 'other', addedAt: now });
+    }
+    const data = loadChannelMyList(req.params.owner);
+    data.items.push(...added);
     saveChannelMyList(req.params.owner, data);
-    res.json({ success: true, added, total: data.items.length, warning });
+    res.json({ success: true, added, total: data.items.length });
 });
 
 app.post('/api/mylist/:owner/remove/:index', requireAuth, (req, res) => {
@@ -785,10 +604,13 @@ app.post('/api/mylist/:owner/shuffle', requireAuth, (req, res) => {
 
     const data = loadChannelMyList(channel);
     // Fisher-Yates gives every ordering the same chance and keeps duplicates.
-    for (let i = data.items.length - 1; i > 0; i--) {
+    const next = data.items.filter(item => item._playNext);
+    const shuffled = data.items.filter(item => !item._playNext);
+    for (let i = shuffled.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
-        [data.items[i], data.items[j]] = [data.items[j], data.items[i]];
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
+    data.items = [...next, ...shuffled];
     saveChannelMyList(channel, data);
     io.to(`ch:${channel}`).emit('queue:update', { channel });
     res.json({ success: true, items: data.items });
@@ -825,8 +647,9 @@ app.post('/api/mode/:channel', requireAuth, (req, res) => {
         const playing = promotedMyListByChannel.get(req.params.channel);
         const list = getMyList(req.params.channel);
         const index = playing ? list.indexOf(playing) : -1;
-        if (mylistLoop && playing && index === -1) list.push(playing);
+        if (mylistLoop && playing && !playing._playNext && !retiredMyListSongs.has(playing) && index === -1) list.push(playing);
         if (!mylistLoop && index !== -1) list.splice(index, 1);
+        saveChannelMyList(req.params.channel, { items: list });
     }
     saveChannelMode(req.params.channel, data);
     io.to(`ch:${req.params.channel}`).emit('queue:update', { channel: req.params.channel });
@@ -849,7 +672,7 @@ async function promoteMyListHeadToBasti(ch) {
         const index = current.items.indexOf(head);
         if (index !== -1) {
             current.items.splice(index, 1);
-            if (loadChannelMode(ch).mylistLoop) current.items.push(head);
+            if (loadChannelMode(ch).mylistLoop && !head._playNext) current.items.push(head);
             saveChannelMyList(ch, current);
         }
         playbackByChannel.delete(ch);
@@ -1083,9 +906,13 @@ app.get('/api/channels/:ch/current', async (req, res) => {
             //  - ANY mode      : automatic fallback — if there's no viewer song to
             //                    play but a personal-list song exists, promote it so
             //                    the overlay never dead-ends on an empty viewer list.
+            const waitingFor = personalListWaitByChannel.get(ch);
+            const waitingForCurrent = waitingFor && waitingFor === songIdentity(media[0]);
+            if (!waitingForCurrent) personalListWaitByChannel.delete(ch);
+            const playNext = getMyList(ch)[0]?._playNext === true;
             const wantMyList =
-                !topIsOwner && hasMyListSong &&
-                (effectiveSource === 'mylist' || !hasViewerSong);
+                !waitingForCurrent && !topIsOwner && hasMyListSong &&
+                (playNext || effectiveSource === 'mylist' || !hasViewerSong);
 
             if (wantMyList) {
                 const pushed = await promoteMyListHeadToBasti(ch);
@@ -1096,7 +923,7 @@ app.get('/api/channels/:ch/current', async (req, res) => {
             }
 
             const current = media[0]
-                ? { ...media[0], _source: isOwnerSong(media[0], ch) ? 'mylist' : 'requests' }
+                ? { ...decorateOwnerSong(ch, media[0]), _source: isOwnerSong(media[0], ch) ? 'mylist' : 'requests' }
                 : null;
             const playbackId = playbackIdFor(ch, current);
             if (current) current._playbackId = playbackId;
@@ -1124,6 +951,7 @@ app.post('/api/channels/:ch/next', async (req, res) => {
             if (req.body.playbackId && req.body.playbackId !== playbackByChannel.get(ch)?.id)
                 return res.json({ success: true, advanced: false });
             await bastiPost(`/removemedia/${ch}/0`);
+            personalListWaitByChannel.delete(ch);
             playbackByChannel.delete(ch);
             promotedMyListByChannel.delete(ch);
             if (mode === 'switch') {
@@ -1150,13 +978,44 @@ app.post('/api/webhook/:ch', (req, res) => {
     res.status(200).json({ success: true });
 });
 
-// ── Local media (MP3 upload, folder management, instant playback) ─────────────
+// ── Local music: saved YouTube playlists and uploaded MP3s ───────────────────
 
-const LOCAL_MEDIA_ROOT = process.env.LOCAL_MEDIA_ROOT || path.join(__dirname, '../..', 'data', 'local-media');
+function songIdentity(item) {
+    return item ? JSON.stringify([item.id || null, item.media || item.url, item.username]) : null;
+}
+
+function decorateOwnerSong(channel, item) {
+    const playing = promotedMyListByChannel.get(channel);
+    if (!playing || !isOwnerSong(item, channel)) return item;
+    const sameMedia = (parseYouTubeVideoId(playing.url) && parseYouTubeVideoId(playing.url) === parseYouTubeVideoId(item.media || item.url))
+        || playing.url === (item.media || item.url);
+    return sameMedia ? { ...item, song_name: playing.title, title: playing.title, Platform: playing.platform } : item;
+}
+
+async function loadSavedPlaylist(channel, playlist, cancelled = () => false, save = false) {
+    return withPlaybackLock(channel, async () => {
+        const upstream = await bastiGet(`/getallmedia/${encodeURIComponent(channel)}`);
+        if (cancelled()) return false;
+        const playing = promotedMyListByChannel.get(channel);
+        if (save) musicLibrary.saveAndLoad(channel, playlist);
+        else saveChannelMyList(channel, { items: playlist.items });
+        // The new playlist owns the complete upcoming list, including old
+        // loop entries and one-off uploads. Let the current song finish first.
+        if (playing) retiredMyListSongs.add(playing);
+        const current = songIdentity(upstream.media?.[0]);
+        if (current) personalListWaitByChannel.set(channel, current);
+        else personalListWaitByChannel.delete(channel);
+        const mode = loadChannelMode(channel);
+        mode.mode = 'mylist';
+        saveChannelMode(channel, mode);
+        io.to(`ch:${channel}`).emit('queue:update', { channel });
+        return true;
+    });
+}
+
 const playlistImporter = createPlaylistImporter({
-    root: LOCAL_MEDIA_ROOT,
     spawn,
-    normalizeFile: normalizeAudioFile,
+    onSave: (channel, playlist, cancelled) => loadSavedPlaylist(channel, playlist, cancelled, true),
     onChange: (channel, job) => io.to(`ch:${channel}`).emit('local:import:update', { channel, job })
 });
 
@@ -1187,7 +1046,59 @@ app.delete('/api/local/:channel/playlist-import/:id', requireAuth, (req, res) =>
     }
 });
 
-// Queue saved MP3s through the same personal list as pasted media URLs.
+app.get('/api/local/:channel/playlists', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    res.json({ playlists: musicLibrary.playlists(req.params.channel) });
+});
+
+app.post('/api/local/:channel/playlists/:id/load', requireAuth, async (req, res) => {
+    const channel = req.params.channel;
+    if (!hasAccess(req.session.user, channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    const playlist = musicLibrary.playlist(channel, req.params.id);
+    if (!playlist) return res.status(404).json({ error: 'Saved playlist not found.' });
+    try {
+        await loadSavedPlaylist(channel, playlist);
+        res.json({ success: true, total: playlist.items.length });
+    } catch {
+        res.status(502).json({ error: 'Could not load the playlist. Your music list was kept.' });
+    }
+});
+
+app.delete('/api/local/:channel/playlists/:id', requireAuth, (req, res) => {
+    const channel = req.params.channel;
+    if (!hasAccess(req.session.user, channel))
+        return res.status(403).json({ error: 'Access denied.' });
+    if (!musicLibrary.removePlaylist(channel, req.params.id))
+        return res.status(404).json({ error: 'Saved playlist not found.' });
+    io.to(`ch:${channel}`).emit('local:library:update', { channel });
+    res.json({ success: true });
+});
+
+function localFileEntry(channel, folder, name) {
+    const parts = [channel, ...(folder ? [folder] : []), name];
+    return { url: `/api/local-media/${parts.map(encodeURIComponent).join('/')}`,
+        title: name, platform: 'local', addedAt: new Date().toISOString() };
+}
+
+async function queueLocalEntries(channel, entries, playNext) {
+    return withPlaybackLock(channel, async () => {
+        if (playNext) {
+            const upstream = await bastiGet(`/getallmedia/${encodeURIComponent(channel)}`);
+            const current = songIdentity(upstream.media?.[0]);
+            if (current) personalListWaitByChannel.set(channel, current);
+        }
+        const data = loadChannelMyList(channel);
+        if (playNext) data.items.unshift(...entries.map(entry => ({ ...entry, _playNext: true })));
+        else data.items.push(...entries);
+        saveChannelMyList(channel, data);
+        io.to(`ch:${channel}`).emit('queue:update', { channel });
+        return data.items.length;
+    });
+}
+
+// A single saved MP3 goes next, even in Requests mode. Folder adds append.
 app.post('/api/local/:channel/queue', requireAuth, async (req, res) => {
     const channel = req.params.channel;
     if (!hasAccess(req.session.user, channel))
@@ -1201,20 +1112,11 @@ app.post('/api/local/:channel/queue', requireAuth, async (req, res) => {
         let files = await listLocalFiles(channel, folder);
         if (filename !== undefined) files = files.filter(file => file.folder === folder && file.name === filename);
         if (files.length === 0) return res.status(404).json({ error: 'No MP3 files found.' });
-        const data = loadChannelMyList(channel);
-        const addedAt = new Date().toISOString();
-        for (const file of files) {
-            const parts = [channel, ...(file.folder ? [file.folder] : []), file.name];
-            data.items.push({
-                url: `/api/local-media/${parts.map(encodeURIComponent).join('/')}`,
-                title: file.name, platform: 'local', addedAt
-            });
-        }
-        saveChannelMyList(channel, data);
-        io.to(`ch:${channel}`).emit('queue:update', { channel });
-        res.json({ success: true, added: files.length, total: data.items.length });
+        const entries = files.map(file => localFileEntry(channel, file.folder, file.name));
+        const total = await queueLocalEntries(channel, entries, filename !== undefined);
+        res.json({ success: true, added: files.length, total, playNext: filename !== undefined });
     } catch {
-        res.status(500).json({ error: 'Could not add local files to My List.' });
+        res.status(502).json({ error: 'Could not queue the files. Please try again.' });
     }
 });
 
@@ -1244,12 +1146,29 @@ const localUpload = multer({
             cb(null, localMediaDir(channel, folder));
         },
         filename(req, file, cb) {
-            const ext  = path.extname(file.originalname) || '.mp3';
-            const base = sanitisePath(path.basename(file.originalname, ext));
-            cb(null, `${base}${ext}`);
+            const ext = path.extname(file.originalname);
+            const base = sanitisePath(path.basename(file.originalname, ext)) || 'Audio';
+            const dir = localMediaDir(req.params.channel, req.params.folder || '');
+            let filename = `${base}.mp3`;
+            let suffix = 2;
+            while (true) {
+                try {
+                    // Reserve the name before Multer opens its write stream.
+                    // Equal filenames in a batch must not overwrite each other.
+                    fs.closeSync(fs.openSync(path.join(dir, filename), 'wx'));
+                    return cb(null, filename);
+                } catch (err) {
+                    if (err.code !== 'EEXIST') return cb(err);
+                    filename = `${base} (${suffix++}).mp3`;
+                }
+            }
         }
     }),
     fileFilter(req, file, cb) {
+        // Browser multipart filenames are UTF-8; Busboy's legacy default is
+        // Latin-1. Recover their original spelling before saving or reporting.
+        const decoded = Buffer.from(file.originalname, 'latin1').toString('utf8');
+        if (!decoded.includes('\uFFFD')) file.originalname = decoded;
         const ext = path.extname(file.originalname).toLowerCase();
         const mime = (file.mimetype || '').toLowerCase();
         // Accept .mp3 extension OR any common MP3 MIME type (browsers/OSes vary).
@@ -1295,9 +1214,6 @@ app.delete('/api/local/:channel/folders/:folder', requireAuth, (req, res) => {
     if (!hasAccess(req.session.user, req.params.channel))
         return res.status(403).json({ error: 'Access denied.' });
     try {
-        const job = playlistImporter.status(req.params.channel);
-        if (job?.status === 'running' && job.folder === req.params.folder)
-            return res.status(409).json({ error: 'Cancel the playlist import before deleting this folder.' });
         const dir = localMediaDir(req.params.channel, req.params.folder);
         fs.rmSync(dir, { recursive: true, force: true });
         res.json({ success: true });
@@ -1353,33 +1269,42 @@ async function listLocalFiles(channel, folder) {
     return files.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-// Upload MP3 files (optionally into a folder).  The :folder param is optional;
-// express doesn't support optional params natively, so we register two routes.
-app.post('/api/local/:channel/upload', requireAuth, (req, res, next) => {
-    req.params.folder = '';
-    next();
-});
-app.post('/api/local/:channel/upload/:folder', requireAuth, (req, res) => {
-    if (!hasAccess(req.session.user, req.params.channel))
+// Uploads are saved and inserted immediately after the currently playing song.
+app.post('/api/local/:channel/upload', requireAuth, uploadLocalFilesEndpoint);
+app.post('/api/local/:channel/upload/:folder', requireAuth, uploadLocalFilesEndpoint);
+
+function uploadLocalFilesEndpoint(req, res) {
+    const channel = req.params.channel;
+    if (!hasAccess(req.session.user, channel))
         return res.status(403).json({ error: 'Access denied.' });
+    const folder = req.params.folder || '';
+    if (sanitisePath(folder) !== folder)
+        return res.status(400).json({ error: 'Invalid folder.' });
     localUpload.array('files', 20)(req, res, async err => {
-        if (err) {
-            const msg = String(err.message || err);
-            if (msg.includes('Only MP3')) return res.status(400).json({ error: msg });
-            return res.status(500).json({ error: msg });
-        }
+        if (err) return res.status(400).json({ error: String(err.message || err) });
         const files = req.files || [];
-        for (const f of files) {
+        if (!files.length) return res.status(400).json({ error: 'Select an MP3 file to upload.' });
+        const saved = [];
+        const warnings = [];
+        for (const file of files) {
             try {
-                await normalizeAudioFile(f.path);
-            } catch (e) {
-                console.error(`Loudness normalisation failed for ${f.path}:`, e.message || e);
+                await normalizeAudioFile(file.path);
+                saved.push(localFileEntry(channel, folder, file.filename));
+            } catch {
+                fs.rmSync(file.path, { force: true });
+                warnings.push(`${file.originalname} could not be read as audio.`);
             }
         }
-        io.to(`ch:${req.params.channel}`).emit('queue:update', { channel: req.params.channel });
-        res.json({ success: true, uploaded: files.length });
+        if (!saved.length) return res.status(422).json({ error: warnings.join(' ') });
+        io.to(`ch:${channel}`).emit('local:library:update', { channel });
+        try {
+            await queueLocalEntries(channel, saved, true);
+            res.json({ success: true, uploaded: saved.length, queued: saved.length, warnings });
+        } catch {
+            res.status(502).json({ error: 'Files were saved, but could not be queued. Use Play next to try again.', uploaded: saved.length });
+        }
     });
-});
+}
 
 // Re-encodes an uploaded MP3 in place to a consistent loudness target (see
 // LOUDNORM_FILTER) so local uploads sound the same volume as YouTube tracks
@@ -1479,40 +1404,42 @@ async function playLocalFileNow(req, res) {
     if (!hasAccess(req.session.user, ch))
         return res.status(403).json({ error: 'Access denied.' });
 
-    try {
-        const folder   = sanitisePath(req.params.folder || '');
-        const filename = sanitisePath(req.params.filename || '');
-        const dir      = localMediaDir(ch, folder);
-        const filePath = path.join(dir, filename);
+    return withPlaybackLock(ch, async () => {
+        try {
+            const folder   = sanitisePath(req.params.folder || '');
+            const filename = sanitisePath(req.params.filename || '');
+            const dir      = localMediaDir(ch, folder);
+            const filePath = path.join(dir, filename);
 
-        if (!filePath.startsWith(localMediaDir(ch)))
-            return res.status(400).json({ error: 'Invalid path.' });
-        if (!fs.existsSync(filePath))
-            return res.status(404).json({ error: 'File not found.' });
+            if (!filePath.startsWith(localMediaDir(ch)))
+                return res.status(400).json({ error: 'Invalid path.' });
+            if (!fs.existsSync(filePath))
+                return res.status(404).json({ error: 'File not found.' });
 
-        // Build a URL the overlay can fetch (localhost from the server's perspective,
-        // but the overlay runs in the browser — use a relative URL).
-        const mediaUrl = folder
-            ? `/api/local-media/${encodeURIComponent(ch)}/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`
-            : `/api/local-media/${encodeURIComponent(ch)}/${encodeURIComponent(filename)}`;
+            // Build a URL the overlay can fetch (localhost from the server's perspective,
+            // but the overlay runs in the browser — use a relative URL).
+            const mediaUrl = folder
+                ? `/api/local-media/${encodeURIComponent(ch)}/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`
+                : `/api/local-media/${encodeURIComponent(ch)}/${encodeURIComponent(filename)}`;
 
-        const user = ownerUsernameFor(ch);
-        const entry = { url: mediaUrl, title: filename, platform: 'local' };
+            const entry = { url: mediaUrl, title: filename, platform: 'local', _playNext: true };
 
-        // Remove the currently-playing item first so the new one plays immediately.
-        try { await bastiPost(`/removemedia/${encodeURIComponent(ch)}/0`); } catch {}
+            // Remove the currently-playing item first so the new one plays immediately.
+            try { await bastiPost(`/removemedia/${encodeURIComponent(ch)}/0`); } catch {}
 
-        // Push the local song to the front of Basti.
-        await pushOwnerSongToBasti(ch, entry);
-        playbackByChannel.delete(ch);
-        promotedMyListByChannel.delete(ch);
+            // Push the local song to the front of Basti.
+            await pushOwnerSongToBasti(ch, entry);
+            playbackByChannel.delete(ch);
+            promotedMyListByChannel.set(ch, entry);
+            personalListWaitByChannel.delete(ch);
 
-        io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
-        res.json({ success: true, url: mediaUrl });
-    } catch (e) {
-        console.error('playLocalFileNow failed:', e.message || e);
-        res.status(500).json({ error: 'Could not play file.' });
-    }
+            io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
+            res.json({ success: true, url: mediaUrl });
+        } catch (e) {
+            console.error('playLocalFileNow failed:', e.message || e);
+            res.status(500).json({ error: 'Could not play file.' });
+        }
+    });
 }
 
 // ── Socket.io ─────────────────────────────────────────────────────────────────

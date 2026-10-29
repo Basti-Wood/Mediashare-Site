@@ -2,15 +2,14 @@
 
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
-const path = require('node:path');
 
 const entries = [
     { id: 'AAAAAAAAAAA', title: 'First song' },
     { id: 'BBBBBBBBBBB', title: 'Second song' }
 ];
 
-// Fake only the executable boundary. The import manager still writes real
-// temporary files, performs normalization callbacks and handles child events.
+// Only metadata lookup and local-upload normalization are allowed. Any attempt
+// to download playlist audio fails this fake executable boundary.
 function createDownloader(options = {}) {
     const calls = [];
     const blocked = [];
@@ -29,7 +28,6 @@ function createDownloader(options = {}) {
                 return close(-2);
             }
             if (command === 'ffmpeg') {
-                if (args.includes('-version')) return close(0);
                 if (options.normalizeFailure) {
                     child.stderr.emit('data', Buffer.from('Normalization failed'));
                     return close(1);
@@ -37,29 +35,19 @@ function createDownloader(options = {}) {
                 fs.writeFileSync(args.at(-1), Buffer.from('ID3 normalized test audio'));
                 return close(0);
             }
-            if (command !== 'yt-dlp') throw new Error('Unexpected command: ' + command);
-            if (args.includes('--dump-single-json')) {
-                child.stdout.emit('data', Buffer.from(options.invalidMetadata ? 'invalid' : JSON.stringify({
-                    title: 'Test playlist', entries: options.entries || entries
-                })));
-                return close(0);
+            if (command !== 'yt-dlp' || !args.includes('--skip-download') || !args.includes('--dump-single-json')) {
+                child.emit('error', new Error('Unexpected audio download: ' + command));
+                return close(1);
             }
-            const id = new URL(args.at(-1)).searchParams.get('v');
-            const download = () => {
+            const read = () => {
                 if (closed) return;
-                if (options.failId === id) {
-                    child.stderr.emit('data', Buffer.from('Video unavailable'));
-                    return close(1);
-                }
-                const template = args[args.indexOf('--output') + 1];
-                const filename = template.replace('%(title).120B', 'Saved_song')
-                    .replace('%(id)s', id).replace('%(ext)s', 'mp3');
-                fs.mkdirSync(path.dirname(filename), { recursive: true });
-                fs.writeFileSync(filename, options.audio || Buffer.from('ID3 downloaded test audio'));
+                child.stdout.emit('data', Buffer.from(options.invalidMetadata ? 'invalid' : JSON.stringify({
+                    title: options.title || 'Test playlist', entries: options.entries ?? entries
+                })));
                 close(0);
             };
-            if (options.blockId === id) blocked.push(download);
-            else download();
+            if (options.blockMetadata) blocked.push(read);
+            else read();
         });
         return child;
     }

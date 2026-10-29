@@ -1,7 +1,5 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
 const { randomUUID } = require('crypto');
 const { spawn: defaultSpawn } = require('child_process');
 
@@ -24,14 +22,14 @@ function safeSegment(value) {
     return segment;
 }
 
-function createPlaylistImporter({ root, spawn = defaultSpawn, normalizeFile, onChange = () => {} }) {
+function createPlaylistImporter({ spawn = defaultSpawn, onSave, onChange = () => {} }) {
     const jobs = new Map();
 
     function view(job) {
         if (!job) return null;
-        const { id, status, folder, title, total, processed, saved, skipped, failed,
+        const { id, status, playlistId, url, title, total, processed, saved, skipped, failed,
             currentTitle, error, warnings, startedAt, finishedAt } = job;
-        return { id, status, folder, title, total, processed, saved, skipped, failed,
+        return { id, status, playlistId, url, title, total, processed, saved, skipped, failed,
             currentTitle, error, warnings: [...warnings], startedAt, finishedAt,
             cancelling: job.cancelled && status === 'running' };
     }
@@ -43,12 +41,19 @@ function createPlaylistImporter({ root, spawn = defaultSpawn, normalizeFile, onC
             if (job.cancelled) return reject(new Error('Import cancelled.'));
             const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: false });
             job.child = child;
+            let timedOut = false;
+            job.timeoutTimer = setTimeout(() => {
+                timedOut = true;
+                child.kill('SIGKILL');
+            }, 90000);
+            job.timeoutTimer.unref();
             let output = '';
             let stderr = '';
             let overflow = false;
             const cleanup = () => {
                 if (job.child === child) job.child = null;
                 clearTimeout(job.killTimer);
+                clearTimeout(job.timeoutTimer);
             };
             child.stdout.on('data', chunk => {
                 if (overflow) return;
@@ -69,6 +74,7 @@ function createPlaylistImporter({ root, spawn = defaultSpawn, normalizeFile, onC
             child.on('close', code => {
                 cleanup();
                 if (job.cancelled) return reject(new Error('Import cancelled.'));
+                if (timedOut) return reject(new Error('Reading the playlist timed out. Please try again.'));
                 if (overflow) return reject(new Error('The playlist metadata is too large to import.'));
                 if (code !== 0) return reject(new Error(stderr.trim() || `${command} exited with code ${code}.`));
                 resolve(output);
@@ -76,87 +82,51 @@ function createPlaylistImporter({ root, spawn = defaultSpawn, normalizeFile, onC
         });
     }
 
-    async function work(job, source) {
-        const staging = path.join(root, '.playlist-downloads', job.id);
-        const target = path.join(root, safeSegment(job.channel), job.folder);
+    async function work(job) {
         try {
-            fs.mkdirSync(staging, { recursive: true });
-            fs.mkdirSync(target, { recursive: true });
-            await run(job, 'ffmpeg', ['-version']);
-            const common = ['--ignore-config', '--js-runtimes', 'node', '--socket-timeout', '30', '--retries', '2'];
             const raw = await run(job, 'yt-dlp', [
-                ...common, '--flat-playlist', '--dump-single-json', '--skip-download', '--ignore-errors', '--', source
+                '--ignore-config', '--js-runtimes', 'node', '--socket-timeout', '30', '--retries', '2',
+                '--flat-playlist', '--dump-single-json', '--skip-download', '--ignore-errors', '--', job.url
             ]);
             let metadata;
             try { metadata = JSON.parse(raw); }
             catch { throw new Error('Could not read the playlist. Check its URL and visibility.'); }
-            const entries = Array.isArray(metadata.entries) ? metadata.entries : [];
+            const entries = Array.isArray(metadata?.entries) ? metadata.entries : [];
             if (!entries.length) throw new Error('No videos found. Check that the playlist is public or unlisted.');
-            job.title = metadata.title || job.title;
+            job.title = String(metadata.title || 'YouTube playlist');
             job.total = entries.length;
-            publish(job);
-
-            for (let i = 0; i < entries.length && !job.cancelled; i++) {
-                const entry = entries[i];
-                const itemDir = path.join(staging, String(i));
-                job.currentTitle = String(entry?.title || `Video ${i + 1}`);
-                publish(job);
-                try {
-                    if (!/^[A-Za-z0-9_-]{11}$/.test(entry?.id || ''))
-                        throw new Error('This playlist entry is unavailable.');
-                    fs.mkdirSync(itemDir, { recursive: true });
-                    await run(job, 'yt-dlp', [
-                        ...common, '--no-playlist', '--format', 'bestaudio/best',
-                        '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '192K',
-                        '--restrict-filenames', '--windows-filenames', '--no-overwrites', '--no-progress',
-                        '--output', path.join(itemDir, '%(title).120B [%(id)s].%(ext)s'),
-                        '--', `https://www.youtube.com/watch?v=${entry.id}`
-                    ], 128 * 1024);
-                    if (job.cancelled) break;
-                    const mp3 = fs.readdirSync(itemDir, { withFileTypes: true })
-                        .find(file => file.isFile() && file.name.toLowerCase().endsWith('.mp3'));
-                    if (!mp3) throw new Error('No MP3 was produced for this video.');
-                    const downloaded = path.join(itemDir, mp3.name);
-                    const filename = `${String(i + 1).padStart(5, '0')} - ${mp3.name}`;
-                    const destination = path.join(target, filename);
-                    if (fs.existsSync(destination)) {
-                        job.skipped++;
-                    } else {
-                        await normalizeFile(downloaded);
-                        if (job.cancelled) break;
-                        try {
-                            // Never overwrite existing uploads or another import.
-                            fs.copyFileSync(downloaded, destination, fs.constants.COPYFILE_EXCL);
-                            job.saved++;
-                        } catch (err) {
-                            if (err.code !== 'EEXIST') throw err;
-                            job.skipped++;
-                        }
-                    }
-                } catch (err) {
-                    if (job.cancelled) break;
-                    job.failed++;
-                    if (job.warnings.length < 5)
-                        job.warnings.push(`${job.currentTitle}: ${err.message}`);
-                } finally {
-                    fs.rmSync(itemDir, { recursive: true, force: true });
+            const addedAt = new Date().toISOString();
+            const items = [];
+            for (const entry of entries) {
+                if (!/^[A-Za-z0-9_-]{11}$/.test(entry?.id || '')
+                    || ['private', 'premium_only', 'subscriber_only', 'needs_auth'].includes(entry.availability)
+                    || ['[Private video]', '[Deleted video]', 'Private video', 'Deleted video'].includes(entry.title)) {
+                    job.skipped++;
+                } else {
+                    items.push({ url: `https://www.youtube.com/watch?v=${entry.id}`,
+                        title: String(entry.title || `YouTube video (${entry.id})`), platform: 'youtube', addedAt });
                 }
-                job.processed++;
-                publish(job);
             }
-            job.status = job.cancelled ? 'cancelled'
-                : job.failed === 0 ? 'completed'
-                : job.saved + job.skipped > 0 ? 'partial' : 'failed';
-            if (job.status === 'failed') job.error = job.warnings[0] || 'No songs could be saved.';
+            job.processed = entries.length;
+            if (!items.length) throw new Error('This playlist has no available songs. Your music list was kept.');
+            if (job.cancelled) return;
+            const committed = await onSave(job.channel, {
+                id: job.playlistId, url: job.url, title: job.title, items, savedAt: addedAt
+            }, () => job.cancelled);
+            if (committed === false) return;
+            job.saved = items.length;
+            job.status = job.skipped ? 'partial' : 'completed';
+            if (job.skipped) job.warnings.push(`${job.skipped} unavailable playlist entries were skipped.`);
         } catch (err) {
-            job.status = job.cancelled ? 'cancelled' : 'failed';
-            if (!job.cancelled) job.error = err.message;
+            job.status = 'failed';
+            job.error = err.message;
         } finally {
-            clearTimeout(job.killTimer);
-            try { fs.rmSync(staging, { recursive: true, force: true }); }
-            catch {
-                if (job.warnings.length < 5) job.warnings.push('Temporary download files could not be removed.');
+            if (job.cancelled && !job.saved) {
+                job.status = 'cancelled';
+                job.error = null;
             }
+            clearTimeout(job.killTimer);
+            clearTimeout(job.timeoutTimer);
             job.currentTitle = '';
             job.finishedAt = new Date().toISOString();
             publish(job);
@@ -164,14 +134,13 @@ function createPlaylistImporter({ root, spawn = defaultSpawn, normalizeFile, onC
     }
 
     return {
-        start(channel, { url, folder } = {}) {
+        start(channel, { url } = {}) {
             const source = playlistUrl(url);
             safeSegment(channel);
-            const destination = safeSegment(folder || `YouTube-${source.id}`);
             if (jobs.get(channel)?.status === 'running')
                 throw Object.assign(new Error('A playlist import is already running for this channel.'), { status: 409 });
             const job = {
-                id: randomUUID(), channel, folder: destination, title: 'YouTube playlist',
+                id: randomUUID(), channel, playlistId: source.id, url: source.url, title: 'YouTube playlist',
                 status: 'running', total: null, processed: 0, saved: 0, skipped: 0, failed: 0,
                 currentTitle: '', error: null, warnings: [], startedAt: new Date().toISOString(), finishedAt: null,
                 cancelled: false, child: null
@@ -179,8 +148,8 @@ function createPlaylistImporter({ root, spawn = defaultSpawn, normalizeFile, onC
             jobs.set(channel, job);
             publish(job);
             // Keep the request short; status survives dashboard reloads while
-            // this process runs. Completed MP3s are stored on disk.
-            job.done = work(job, source.url);
+            // this process runs. Completed playlists and their queues are persisted.
+            job.done = work(job);
             return view(job);
         },
         status(channel) { return view(jobs.get(channel)); },

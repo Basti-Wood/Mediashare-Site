@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mediashare — Dashboard</title>
     <link rel="stylesheet" href="../styles/bulma/css/bulma.min.css">
-    <link rel="stylesheet" href="../styles/mystyles.css?v=audio-settings-4">
+    <link rel="stylesheet" href="../styles/mystyles.css?v=saved-playlists-1">
 </head>
 <body class="dashboard-body" data-build="audio-settings-4">
 
@@ -128,7 +128,7 @@
                     <ul>
                         <li class="is-active" data-tab="requests"><a>Viewer Requests</a></li>
                         <li data-tab="mylist"><a>My List</a></li>
-                        <li data-tab="local"><a>Local Files</a></li>
+                        <li data-tab="local"><a>Local Music</a></li>
                     </ul>
                 </div>
 
@@ -203,7 +203,7 @@
                     </table>
                 </div>
 
-                <!-- ── Local Files panel ── -->
+                <!-- ── Local Music panel ── -->
                 <div id="panel-local" style="display:none">
                     <!-- Folder creation -->
                     <div class="field has-addons mb-1">
@@ -230,33 +230,36 @@
                         </div>
                         <div class="control">
                             <label class="button is-small is-link" for="local-file-input"
-                                   id="local-upload-label">Upload MP3</label>
+                                   id="local-upload-label">Upload &amp; play next</label>
                             <input id="local-file-input" class="is-hidden" type="file"
                                    accept=".mp3,audio/mpeg,audio/mp3,audio/x-mp3,audio/x-mpeg" multiple>
                         </div>
                     </div>
                     <p id="local-upload-status" class="is-size-7 mb-3"></p>
 
-                    <!-- YouTube playlists are saved alongside uploaded MP3s. -->
+                    <!-- Store YouTube playlist links and titles; load replaces the upcoming list. -->
                     <div class="local-playlist-import mb-4">
-                        <label class="label is-small" for="local-playlist-url">Save a YouTube playlist as MP3s</label>
+                        <label class="label is-small" for="local-playlist-url">Save a YouTube playlist</label>
                         <input id="local-playlist-url" class="input is-small mb-2" type="url"
                                placeholder="https://www.youtube.com/playlist?list=…">
                         <div class="buttons are-small mb-1">
                             <button id="local-playlist-import-btn" class="button is-small is-link" type="button">
-                                ↓ Save playlist as MP3s
+                                Save &amp; load playlist
                             </button>
                             <button id="local-playlist-cancel-btn" class="button is-small is-danger is-outlined"
-                                    type="button" hidden>Cancel download</button>
+                                    type="button" hidden>Cancel import</button>
                         </div>
                         <p class="is-size-7 has-text-grey mb-2">
-                            Saves to the selected folder, or creates a playlist folder when none is selected.
-                            Completed songs remain available if a download is cancelled.
+                            Saves YouTube links and loads the playlist into My List, replacing all upcoming songs.
+                            The current song finishes first. Uploaded audio files can be queued next.
                         </p>
                         <progress id="local-playlist-progress" class="progress is-small is-link mb-2"
-                                  max="100" value="0" hidden aria-label="Playlist download progress"></progress>
+                                  max="100" value="0" hidden aria-label="Playlist import progress"></progress>
                         <p id="local-playlist-status" class="is-size-7 mb-0" role="status" aria-live="polite"></p>
                     </div>
+
+                    <p class="heading mb-2">Saved playlists</p>
+                    <div id="local-saved-playlists" class="mb-4" role="status" aria-live="polite"></div>
 
                     <!-- Folder list -->
                     <div class="level mb-2">
@@ -270,7 +273,7 @@
                     <div class="level mb-2">
                         <div class="level-left">
                             <p class="heading level-item">
-                                Files&nbsp;<span id="local-file-count" class="tag is-dark">0</span>
+                                Uploaded files&nbsp;<span id="local-file-count" class="tag is-dark">0</span>
                             </p>
                         </div>
                         <div class="level-right">
@@ -281,7 +284,7 @@
                     </div>
 
                     <div id="local-file-empty" class="has-text-centered has-text-grey py-4">
-                        No local files yet.
+                        No uploaded audio files yet. Upload an MP3 to play it next.
                     </div>
 
                     <table class="table is-fullwidth is-hoverable is-narrow"
@@ -304,6 +307,6 @@
 
     <!-- Socket.io client -->
     <script src="/socket.io/socket.io.js"></script>
-    <script src="../scrs/frontend/main.js?v=audio-settings-4"></script>
+    <script src="../scrs/frontend/main.js?v=saved-playlists-1"></script>
 </body>
 </html>

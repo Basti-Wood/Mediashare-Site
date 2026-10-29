@@ -15,6 +15,6 @@ services:
       - ./src:/app/src:ro
       - ./styles:/app/styles:ro
       - ./index.html:/app/index.html:ro
-      # Keep uploaded and downloaded MP3s when the container is rebuilt.
+      # Keep uploaded MP3s, saved playlists and user settings across rebuilds.
       - ./data:/app/data
     restart: unless-stopped
