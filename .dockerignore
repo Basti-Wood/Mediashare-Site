@@ -9,4 +9,5 @@ README*
 *.log
 data/local-media/
 data/audio-settings/
+data/sessions/
 tests/.tmp-*/

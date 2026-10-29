@@ -12,22 +12,24 @@ const serverFile = path.resolve(__dirname, '../../scrs/backend/server.js');
 const serverRequire = createRequire(serverFile);
 
 async function createTestServer(options = {}) {
-    const localRoot = fs.mkdtempSync(path.resolve(__dirname, '../.tmp-media-'));
+    const localRoot = options.localRoot || fs.mkdtempSync(path.resolve(__dirname, '../.tmp-media-'));
     const queues = new Map();
     const calls = [];
     const events = [];
-    const accounts = ['alice', 'bob'].map(channel => ({
+    const accounts = options.accounts || ['alice', 'bob'].map(channel => ({
         username: channel, password: 'test-only', channel, access_accounts: []
     }));
     let server;
     let listen;
     let failPromotion = null;
     let beforePromotion = null;
+    let closed = false;
 
     const sandbox = {
         __dirname: path.dirname(serverFile),
         process: { env: { SESSION_SECRET: 'test-only', BASTI_POLLING_ONLY: 'true', LOCAL_MEDIA_ROOT: localRoot,
-            AUDIO_SETTINGS_ROOT: path.join(localRoot, '.audio-settings') } },
+            AUDIO_SETTINGS_ROOT: path.join(localRoot, '.audio-settings'),
+            SESSION_STORE_ROOT: path.join(localRoot, '.sessions'), ...options.env } },
         console: { log() {}, warn() {}, error() {} },
         Buffer, URL, URLSearchParams, setTimeout, clearTimeout, setInterval, clearInterval,
         Math: Object.assign(Object.create(Math), { random: options.random || Math.random }),
@@ -91,20 +93,20 @@ async function createTestServer(options = {}) {
             return { ok: true, json: async () => ({ success: true }) };
         }
     };
-    const { playlistImporter } = vm.runInNewContext(
-        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter });', sandbox, { filename: serverFile });
+    const { playlistImporter, sessionStore } = vm.runInNewContext(
+        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter, sessionStore });', sandbox, { filename: serverFile });
     server.listen = listen;
     await new Promise(resolve => listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
 
-    async function request(route, { method = 'GET', body, cookie } = {}) {
+    async function request(route, { method = 'GET', body, cookie, headers = {} } = {}) {
         const res = await fetch(base + route, {
             method,
-            headers: { ...(cookie ? { Cookie: cookie } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+            headers: { ...headers, ...(cookie ? { Cookie: cookie } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
             body: body === undefined ? undefined : JSON.stringify(body)
         });
         const data = await res.json();
-        return { status: res.status, data, cookie: res.headers.get('set-cookie')?.split(';')[0] };
+        return { status: res.status, data, setCookie: res.headers.get('set-cookie'), cookie: res.headers.get('set-cookie')?.split(';')[0] };
     }
 
     async function login(channel = 'alice') {
@@ -112,11 +114,13 @@ async function createTestServer(options = {}) {
     }
 
     return {
-        base, calls, events, queues, request, login, localRoot,
+        base, calls, events, queues, request, login, localRoot, accounts, sessionStore,
         settleImport(channel = 'alice') { return playlistImporter.settle(channel); },
         failPromotion(kind) { failPromotion = kind; },
         beforePromotion(action) { beforePromotion = action; },
         async close() {
+            if (closed) return;
+            closed = true;
             for (const channel of ['alice', 'bob']) {
                 const job = playlistImporter.status(channel);
                 if (job?.status === 'running') playlistImporter.cancel(channel, job.id);
@@ -124,7 +128,8 @@ async function createTestServer(options = {}) {
             }
             server.closeAllConnections();
             await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
-            fs.rmSync(localRoot, { recursive: true, force: true });
+            await sessionStore.close();
+            if (!options.preserveData) fs.rmSync(localRoot, { recursive: true, force: true });
         }
     };
 }
