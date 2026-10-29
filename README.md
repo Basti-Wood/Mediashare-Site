@@ -1,5 +1,27 @@
 # Mediashare
 
+## Stay signed in
+
+Leave **Stay signed in for 30 days** checked when logging in. Your browser will
+open the dashboard automatically on later visits, and activity renews the
+remembered login. Uncheck it to use a browser-session cookie instead.
+
+Login sessions survive server restarts using `./data/sessions` under the
+persistent Docker data mount. Cookies contain an opaque session ID; passwords
+are not saved in cookies or browser storage. The cookies are HttpOnly,
+SameSite=Lax, and Secure when served over HTTPS. Logging out revokes the current
+browser's session. Changing an account's password or removing the account also
+invalidates its remembered logins.
+
+Keep `SESSION_SECRET` stable between deployments. If it is unset, the server
+creates a private signing secret in the persistent session directory. Changing
+the secret requires users to sign in again. `TRUST_PROXY=1` assumes the existing
+single reverse proxy; use `TRUST_PROXY=0` for a direct HTTP deployment.
+
+After installing this update, sign in once to create the new remembered cookie.
+Session data is excluded from Git and Docker builds and blocked from direct web
+downloads.
+
 ## Loop and shuffle
 
 The **Loop My List: On/Off** and **Shuffle My List** buttons sit directly below

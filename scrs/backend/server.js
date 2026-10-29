@@ -6,18 +6,25 @@ const session  = require('express-session');
 const http     = require('http');
 const path     = require('path');
 const fs       = require('fs');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHmac } = require('crypto');
 const { execFile, spawn } = require('child_process');
 const multer   = require('multer');
 const WebSocket = require('ws');
 const { Server } = require('socket.io');
 const { createPlaylistImporter } = require('./playlist-imports');
 const { createAudioSettings } = require('./audio-settings');
+const { FileSessionStore, persistentSessionSecret, REMEMBER_LOGIN_MS } = require('./session-store');
 
 const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server);
 const audioSettings = createAudioSettings(process.env.AUDIO_SETTINGS_ROOT || path.join(__dirname, '../..', 'data', 'audio-settings'));
+const sessionDirectory = process.env.SESSION_STORE_ROOT || path.join(__dirname, '../..', 'data', 'sessions');
+const sessionSecret = process.env.SESSION_SECRET || persistentSessionSecret(sessionDirectory);
+const sessionStore = new FileSessionStore(sessionDirectory);
+const SESSION_COOKIE_NAME = 'mediashare.sid';
+const trustProxy = String(process.env.TRUST_PROXY ?? '1');
+app.set('trust proxy', /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy);
 
 const BASTI_BASE = 'https://api.bastiwood.com';
 const BASTI_WS_BASE = String(process.env.BASTI_WS_BASE || BASTI_BASE)
@@ -518,18 +525,28 @@ async function expandYouTubePlaylist(playlistId) {
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
-// Block raw access to config/env files
-app.use('/conf', (_req, res) => res.status(403).end());
-app.use('/.env', (_req, res) => res.status(403).end());
+// The static server decodes URLs. Normalize the path here too, so encoded
+// directory names cannot expose private config or persistent session records.
+app.use((req, res, next) => {
+    let pathname;
+    try { pathname = path.posix.normalize('/' + decodeURIComponent(req.path)).toLowerCase(); }
+    catch { return res.status(400).end(); }
+    if (['/conf', '/.env', '/data'].some(root => pathname === root || pathname.startsWith(root + '/')))
+        return res.status(403).end();
+    next();
+});
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 app.use(session({
-    secret:            process.env.SESSION_SECRET || 'change_me',
+    name:              SESSION_COOKIE_NAME,
+    secret:            sessionSecret,
+    store:             sessionStore,
     resave:            false,
     saveUninitialized: false,
-    cookie: { httpOnly: true, maxAge: 24 * 60 * 60 * 1000 }
+    rolling:           true,
+    cookie: { httpOnly: true, sameSite: 'lax', secure: 'auto', maxAge: REMEMBER_LOGIN_MS }
 }));
 
 app.use(express.static(path.join(__dirname, '../..')));
@@ -539,14 +556,39 @@ app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
 function requireAuth(req, res, next) {
     if (!req.session.user) return res.status(401).json({ error: 'Not logged in.' });
+    let accounts;
+    try { accounts = loadAccounts(); }
+    catch { return res.status(503).json({ error: 'Cannot read accounts.' }); }
+    const account = accounts.find(a => a.username === req.session.user.username);
+    if (!account || req.session.authVersion !== authenticationVersion(account)) {
+        return req.session.destroy(() => {
+            clearLoginCookie(req, res);
+            res.status(401).json({ error: 'Please sign in again.' });
+        });
+    }
+    req.session.user = sessionUser(account, accounts);
     next();
+}
+
+function authenticationVersion(account) {
+    return createHmac('sha256', sessionSecret).update(JSON.stringify([account.username, account.password])).digest('hex');
+}
+
+function sessionUser(account, accounts) {
+    return { username: account.username, channel: account.channel || account.username.toLowerCase(),
+        access_accounts: getViewersForAccount(accounts, account) };
+}
+
+function clearLoginCookie(req, res) {
+    res.clearCookie(SESSION_COOKIE_NAME, { path: '/', httpOnly: true, sameSite: 'lax', secure: req.secure });
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 app.post('/api/auth/login', (req, res) => {
-    const { username, password } = req.body;
+    const { username, password, rememberMe = true } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Missing credentials.' });
+    if (typeof rememberMe !== 'boolean') return res.status(400).json({ error: 'rememberMe must be a boolean.' });
 
     let accounts;
     try { accounts = loadAccounts(); }
@@ -555,21 +597,24 @@ app.post('/api/auth/login', (req, res) => {
     const account = accounts.find(a => a.username === username && a.password === password);
     if (!account) return res.status(401).json({ error: 'Invalid username or password.' });
 
-    const viewers = getViewersForAccount(accounts, account);
-
     req.session.regenerate(err => {
         if (err) return res.status(500).json({ error: 'Session error.' });
-        req.session.user = {
-            username:        account.username,
-            channel:         account.channel || account.username.toLowerCase(),
-            access_accounts: viewers
-        };
-        res.json({ success: true, user: req.session.user });
+        req.session.user = sessionUser(account, accounts);
+        req.session.authVersion = authenticationVersion(account);
+        req.session.cookie.maxAge = rememberMe ? REMEMBER_LOGIN_MS : null;
+        req.session.save(err => {
+            if (err) return res.status(500).json({ error: 'Could not save login session.' });
+            res.json({ success: true, user: req.session.user });
+        });
     });
 });
 
 app.post('/api/auth/logout', (req, res) => {
-    req.session.destroy(() => res.json({ success: true }));
+    req.session.destroy(err => {
+        if (err) return res.status(500).json({ error: 'Could not log out.' });
+        clearLoginCookie(req, res);
+        res.json({ success: true });
+    });
 });
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
