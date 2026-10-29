@@ -42,7 +42,7 @@ function frontend(h, file, cookie) {
     const context = vm.createContext({
         document: { getElementById: element, addEventListener() {}, visibilityState: 'visible', hidden: false },
         window: { location: { origin: h.base, search: '?channel=alice&controls=1', href: '' }, addEventListener() {} },
-        navigator: {}, URLSearchParams,
+        navigator: {}, URLSearchParams, FormData, Blob,
         console: { log() {}, warn() {}, error: (...args) => errors.push(args) },
         setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 1; }, clearInterval() {},
         io: () => ({ on(event, handler) { socketHandlers.set(event, handler); }, emit() {} }),
@@ -168,7 +168,7 @@ test('Loop and Shuffle are real buttons above every tab panel', () => {
     assert.equal(html.includes('mylist-loop-toggle'), false);
 });
 
-test('Local Files button imports a playlist, restores its progress and queues MP3s for the global controls', async t => {
+test('Local Music imports and loads saved YouTube links and restores them on reload', async t => {
     const downloader = createDownloader();
     const h = await setup(t, { spawn: downloader.spawn });
     const ui = frontend(h, 'main.js', h.cookie);
@@ -179,21 +179,21 @@ test('Local Files button imports a playlist, restores its progress and queues MP
     await h.settleImport();
     await ui.run('loadLocalImport()');
     await ui.run('loadLocalFiles()');
-    assert.match(ui.elements.get('local-playlist-status').textContent, /Download complete: 2 saved/);
+    assert.match(ui.elements.get('local-playlist-status').textContent, /Playlist saved and loaded: 2 songs saved/);
     assert.equal(ui.elements.get('local-playlist-import-btn').disabled, false);
     assert.equal(ui.elements.get('local-playlist-cancel-btn').hidden, true);
-    assert.equal(ui.elements.get('local-queue-folder-btn').disabled, false);
-    await ui.elements.get('local-queue-folder-btn').fire('click');
+    assert.match(ui.elements.get('local-saved-playlists').innerHTML, /Test playlist/);
+    assert.equal(ui.elements.get('local-queue-folder-btn').disabled, true);
     const list = (await h.api('/api/mylist/alice')).data.items;
     assert.equal(list.length, 2);
-    assert.ok(list.every(item => item.platform === 'local'));
+    assert.ok(list.every(item => item.platform === 'youtube'));
     assert.equal(ui.elements.get('mylist-shuffle-btn').disabled, false);
     await ui.elements.get('mylist-loop-btn').fire('click');
     assert.equal((await h.api('/api/mode/alice')).data.mylistLoop, true);
     const reload = frontend(h, 'main.js', h.cookie);
     await reload.ready;
     await reload.run('loadLocalImport()');
-    assert.match(reload.elements.get('local-playlist-status').textContent, /2 saved/);
+    assert.match(reload.elements.get('local-playlist-status').textContent, /2 songs saved/);
     assert.deepEqual(ui.errors, []);
     assert.deepEqual(reload.errors, []);
 });
@@ -208,8 +208,8 @@ test('playlist import button displays invalid URL feedback and can be retried', 
     assert.equal(ui.elements.get('local-playlist-import-btn').disabled, false);
 });
 
-test('the download cancellation button stops an active playlist import', async t => {
-    const downloader = createDownloader({ blockId: 'AAAAAAAAAAA' });
+test('the cancellation button stops reading metadata and keeps the music list', async t => {
+    const downloader = createDownloader({ blockMetadata: true });
     const h = await setup(t, { spawn: downloader.spawn });
     const ui = frontend(h, 'main.js', h.cookie);
     await ui.ready;
@@ -220,7 +220,7 @@ test('the download cancellation button stops an active playlist import', async t
     await ui.elements.get('local-playlist-cancel-btn').fire('click');
     await h.settleImport();
     await ui.run('loadLocalImport()');
-    assert.match(ui.elements.get('local-playlist-status').textContent, /Download cancelled/);
+    assert.match(ui.elements.get('local-playlist-status').textContent, /Import cancelled/);
     assert.equal(ui.elements.get('local-playlist-import-btn').disabled, false);
 });
 
@@ -449,4 +449,76 @@ test('dashboard pause broadcasts to both preview and anonymous OBS without chang
     assert.equal(preview.audios[0].paused, false);
     assert.equal(obs.audios[0].paused, false);
     assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+});
+
+test('saved playlist Load and Delete buttons act on the saved snapshot', async t => {
+    const downloader = createDownloader();
+    const h = await setup(t, { spawn: downloader.spawn });
+    await h.api('/api/local/alice/playlist-import', 'POST', { url: 'https://youtube.com/playlist?list=PLtest123' });
+    await h.settleImport();
+    const ui = frontend(h, 'main.js', h.cookie);
+    await ui.ready;
+    function button(dataset) {
+        return { dataset, handlers: {}, disabled: false,
+            addEventListener(name, handler) { this.handlers[name] = handler; },
+            fire(name) { return this.handlers[name](); } };
+    }
+    const load = button({ playlistLoad: 'PLtest123' });
+    const remove = button({ playlistDelete: 'PLtest123' });
+    ui.elements.get('local-saved-playlists').querySelectorAll = selector => selector.includes('data-playlist-load') ? [load] : [remove];
+    await ui.run('loadLocalPlaylists()');
+    await h.add('CCCCCCCCCCC');
+    assert.equal((await h.api('/api/mylist/alice')).data.items.length, 3);
+    await load.fire('click');
+    assert.equal((await h.api('/api/mylist/alice')).data.items.length, 2);
+    assert.equal(load.disabled, false);
+    assert.match(ui.elements.get('mylist-playback-status').textContent, /My List replaced with 2/);
+    await remove.fire('click');
+    assert.equal((await h.api('/api/local/alice/playlists')).data.playlists.length, 0);
+    assert.equal((await h.api('/api/mylist/alice')).data.items.length, 2);
+    assert.deepEqual(ui.errors, []);
+});
+
+test('pasting a playlist in My List saves it and replaces previous songs too', async t => {
+    const downloader = createDownloader();
+    const h = await setup(t, { spawn: downloader.spawn });
+    await h.add('CCCCCCCCCCC');
+    const ui = frontend(h, 'main.js', h.cookie);
+    await ui.ready;
+    ui.elements.get('mylist-url-input').value = 'https://youtube.com/playlist?list=PLtest123';
+    await ui.elements.get('mylist-add-btn').fire('click');
+    assert.match(ui.elements.get('mylist-add-status').textContent, /Reading playlist/);
+    await h.settleImport();
+    await ui.run('loadLocalImport()');
+    assert.deepEqual((await h.api('/api/mylist/alice')).data.items.map(item => item.title), ['First song', 'Second song']);
+    assert.equal((await h.api('/api/local/alice/playlists')).data.playlists.length, 1);
+});
+
+test('the Upload button saves a named audio file and queues it next', async t => {
+    const downloader = createDownloader();
+    const h = await setup(t, { spawn: downloader.spawn });
+    await h.add('AAAAAAAAAAA');
+    const ui = frontend(h, 'main.js', h.cookie);
+    await ui.ready;
+    ui.elements.get('local-file-input').files = [new File(['ID3 test'], 'Announcement.mp3', { type: 'audio/mpeg' })];
+    await ui.elements.get('local-file-input').fire('change');
+    assert.match(ui.elements.get('local-upload-status').textContent, /1 queued after the current song/);
+    const list = (await h.api('/api/mylist/alice')).data.items;
+    assert.equal(list[0].title, 'Announcement.mp3');
+    assert.equal(list[1].title, 'AAAAAAAAAAA');
+    assert.equal(ui.elements.get('local-file-input').value, '');
+    assert.deepEqual(ui.errors, []);
+});
+
+test('local playback preserves encoded filename characters in the audio URL', async t => {
+    const h = await setup(t);
+    const name = 'A & B #1 + 50%.mp3';
+    fs.mkdirSync(path.join(h.localRoot, 'alice'), { recursive: true });
+    fs.writeFileSync(path.join(h.localRoot, 'alice', name), 'ID3 test');
+    await h.api('/api/local/alice/queue', 'POST', { filename: name });
+    const ui = frontend(h, 'overlay.js', h.cookie);
+    await ui.ready;
+    await until(() => ui.audios[0]?.src);
+    assert.equal(ui.audios[0].src, '/api/local-media/alice/' + encodeURIComponent(name));
+    assert.equal((await fetch(h.base + ui.audios[0].src)).status, 200);
 });

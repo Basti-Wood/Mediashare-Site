@@ -29,24 +29,40 @@ Play Mode, above all three tabs. They work on your personal list, including loca
 MP3s queued there. Shuffle changes the upcoming order and keeps the current song
 playing. Loop repeats the list until switched off.
 
-## Save a YouTube playlist as MP3s
+## Saved playlists and next-song uploads
 
-1. Open **Local Files**. Select a destination folder, or leave **all folders**
-   selected to create a new folder named after the playlist ID.
-2. Paste a public or unlisted YouTube playlist URL and click
-   **Save playlist as MP3s**.
-3. Watch the progress below the button. You can leave the tab or reload the page;
-   the server continues downloading. **Cancel download** stops the remaining
-   downloads and keeps completed songs.
-4. Click **Add these files to My List** to queue the folder, or **+ My List** next
-   to an individual MP3. Use the visible Loop and Shuffle buttons to control it.
+Open **Local Music** (the third tab), paste a public or unlisted YouTube playlist
+URL, and click **Save & load playlist**. This saves the playlist's links, titles
+and original order, then replaces **all upcoming My List songs** and selects
+My List playback. The currently playing song finishes first. No playlist MP3s
+are downloaded or stored. Unavailable entries are skipped; an unreadable or
+cancelled import leaves the previous music list intact.
 
-Downloads preserve playlist order in numbered filenames. Unavailable tracks are
-reported while the remaining tracks continue. Existing files are kept. This uses
-`yt-dlp`, `ffmpeg` and Node.js; the Docker image includes them. The image uses
-Node 24, satisfying yt-dlp's Node 22+ requirement for YouTube challenge solving.
-The audio resolver and importer explicitly enable the Node runtime. See the
-[yt-dlp runtime requirements](https://github.com/yt-dlp/yt-dlp/wiki/EJS#node).
+Saved playlists remain visible in Local Music. **Load & replace My List** loads
+the saved snapshot again, replacing the upcoming list. Reimport the URL to
+refresh it from YouTube. Pasting a playlist into My List uses the same save and
+replace behavior. Loop and Shuffle apply to the loaded songs; saved snapshots
+retain their original order. Both saved playlists and the upcoming list survive
+server restarts in `./data/local-media/.library`.
+
+**Upload & play next** saves an MP3 and queues it after the current song, before
+other requests or playlist tracks. Multiple files retain their upload order.
+Individual files use **Play next** to queue a saved MP3 again; these one-off songs
+play once even when playlist Loop is on. **Play now** explicitly interrupts the
+current song. Adding a whole folder appends its files to My List. Uploading again
+with the same filename creates a numbered copy. Replacing a playlist changes the
+upcoming list; uploaded files and other saved playlists remain available to load.
+
+The site sends each song's `song_name` and `platform` to Basti-API when it becomes
+current, including uploaded filenames. Update Basti-API with its accompanying
+metadata change so `/getallmedia` and the Twitch bot also receive those names.
+Older API versions ignore these query parameters; the dashboard still shows the
+known filename for the current song.
+
+Metadata lookup and live YouTube audio playback use `yt-dlp`; `ffmpeg` normalizes
+uploaded MP3s and the live audio stream. The existing Docker image includes both
+and Node 24. Refresh the dashboard and OBS browser source after updating; both
+scripts are versioned `saved-playlists-1`.
 
 ## If songs immediately skip or audio returns 502
 
@@ -72,10 +88,10 @@ For an older deployed version, append `&ytmode=iframe` to the existing overlay
 URL as a temporary way to bypass the audio proxy. The permanent fix also updates
 the resolver, retains its HTTP headers, and removes stale stream URLs on failure.
 
-If the Local Files playlist form is missing, verify that the feature pull request
+If the Local Music playlist form is missing, verify that the feature pull request
 has been merged and that your deployment has pulled that revision. Refresh the
 dashboard and OBS browser source after updating. The updated overlay script is
-versioned `audio-settings-4`.
+versioned `saved-playlists-1`.
 
 ## Update an existing Docker installation
 
@@ -96,9 +112,9 @@ docker compose build --pull --no-cache
 docker compose up -d
 ```
 
-Refresh the dashboard afterward. Uploads and downloads now live in
-`./data/local-media` on the host and survive container recreation. My List and
-play-mode settings still use the application's existing in-memory storage.
+Refresh the dashboard afterward. Uploaded MP3s and saved playlists live in
+`./data/local-media` on the host and survive container recreation. My List is
+also persisted there; play-mode and loop settings still use in-memory storage.
 The uncached rebuild is needed to install the newer Node runtime and refresh
 yt-dlp; a plain container restart keeps the old image and dependencies.
 

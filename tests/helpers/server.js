@@ -72,7 +72,7 @@ async function createTestServer(options = {}) {
             const [action, channel, username, media] = url.pathname.slice(1).split('/').map(decodeURIComponent);
             const queue = queues.get(channel) || [];
             queues.set(channel, queue);
-            calls.push({ action, channel, method: init.method || 'GET' });
+            calls.push({ action, channel, method: init.method || 'GET', song_name: url.searchParams.get('song_name'), platform: url.searchParams.get('platform') });
             if (action === 'getallmedia')
                 return { ok: true, json: async () => ({ media: queue.map(item => ({ ...item })) }) };
             if (action === 'setmediatop') {
@@ -84,7 +84,9 @@ async function createTestServer(options = {}) {
                     return { ok: failure !== 'http', status: 503, json: async () => ({ success: false, error: 'Rejected' }) };
                 }
                 // Deliberately reuse the upstream ID, including for one-song loops.
-                queue.unshift({ id: 'stable-id', media, username, owner_song: true, Platform: 'youtube' });
+                queue.unshift({ id: 'stable-id', media, username, owner_song: true,
+                    song_name: url.searchParams.get('song_name') || 'Unknown',
+                    Platform: url.searchParams.get('platform') || 'youtube' });
             } else if (action === 'removemedia') {
                 queue.splice(Number(username), 1);
             } else {
@@ -99,11 +101,11 @@ async function createTestServer(options = {}) {
     await new Promise(resolve => listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
 
-    async function request(route, { method = 'GET', body, cookie, headers = {} } = {}) {
+    async function request(route, { method = 'GET', body, form, cookie, headers = {} } = {}) {
         const res = await fetch(base + route, {
             method,
             headers: { ...headers, ...(cookie ? { Cookie: cookie } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-            body: body === undefined ? undefined : JSON.stringify(body)
+            body: form || (body === undefined ? undefined : JSON.stringify(body))
         });
         const data = await res.json();
         return { status: res.status, data, setCookie: res.headers.get('set-cookie'), cookie: res.headers.get('set-cookie')?.split(';')[0] };
