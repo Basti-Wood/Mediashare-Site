@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mediashare connection</title>
+<style>
+body{background:#2d2d2d;color:#eee;font:13px system-ui;margin:16px}label{display:block;margin:14px 0 5px}input{box-sizing:border-box;width:100%;padding:8px;background:#202020;color:#fff;border:1px solid #666;border-radius:4px}button{padding:9px 14px;margin-top:16px;background:#355adb;color:#fff;border:0;border-radius:4px;cursor:pointer}button:disabled{opacity:.5}p{line-height:1.5}a{color:#9bb3ff}.muted{color:#bbb}#status{white-space:pre-wrap}
+</style>
+</head>
+<body>
+<p>In your Mediashare dashboard, open <strong>Stream Deck</strong> and create a connection token for your channel.</p>
+<label for="base-url">Website address</label>
+<input id="base-url" type="url" value="https://media.bastiwood.com" spellcheck="false">
+<label for="token">Connection token</label>
+<input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="msd_…">
+<p class="muted">The website and token are shared by all Mediashare actions in Stream Deck.</p>
+<div id="dial-settings" hidden>
+<label for="step">Volume change per tick (%)</label>
+<input id="step" type="number" min="1" max="10" step="1" value="2">
+<p class="muted">Turn clockwise to increase volume and counterclockwise to decrease it. Press to pause; press again to resume.</p>
+</div>
+<button id="connect" type="button" disabled>Connect</button>
+<p id="status" role="status" aria-live="polite"></p>
+<script src="settings.js"></script>
+</body>
+</html>

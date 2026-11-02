@@ -1,0 +1,71 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "UUID": "com.bastiwood.mediashare",
+  "Name": "Mediashare",
+  "Author": "Basti-Wood",
+  "Description": "Skip songs and control Mediashare volume and playback from Stream Deck.",
+  "Version": "1.0.0.0",
+  "SDKVersion": 2,
+  "CodePath": "bin/plugin.js",
+  "Nodejs": {
+    "Version": "24"
+  },
+  "Software": {
+    "MinimumVersion": "7.1"
+  },
+  "OS": [
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    },
+    {
+      "Platform": "mac",
+      "MinimumVersion": "13"
+    }
+  ],
+  "Icon": "images/plugin",
+  "Category": "Mediashare",
+  "CategoryIcon": "images/category",
+  "PropertyInspectorPath": "ui/settings.html",
+  "URL": "https://github.com/Basti-Wood/Mediashare-Site",
+  "Actions": [
+    {
+      "UUID": "com.bastiwood.mediashare.skip",
+      "Name": "Skip current song",
+      "Tooltip": "Skip the song currently playing in Mediashare.",
+      "Icon": "images/skip",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/skip",
+          "TitleAlignment": "bottom",
+          "FontSize": 12
+        }
+      ]
+    },
+    {
+      "UUID": "com.bastiwood.mediashare.volume",
+      "Name": "Media volume / Pause",
+      "Tooltip": "Turn to adjust media volume. Press to pause or resume the song.",
+      "Icon": "images/volume",
+      "Controllers": [
+        "Encoder"
+      ],
+      "Encoder": {
+        "layout": "$B1",
+        "Icon": "images/volume",
+        "TriggerDescription": {
+          "Rotate": "Adjust media volume",
+          "Push": "Pause / resume song"
+        }
+      },
+      "States": [
+        {
+          "Image": "images/volume"
+        }
+      ]
+    }
+  ]
+}

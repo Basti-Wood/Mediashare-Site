@@ -671,7 +671,7 @@ function playItem(item) {
     // in the URL — detect by the local-media path segment (encoded or not).
     if (platform === 'local' || /(\/|%2F)api(\/|%2F)local-media(\/|%2F)/.test(url)) {
         // Ensure we have a clean, decoded URL for the audio element.
-        const cleanUrl = decodeURIComponent(url);
+        const cleanUrl = /^%2fapi%2flocal-media%2f/i.test(url) ? decodeURIComponent(url) : url;
         playLocalAudio({ ...item, url: cleanUrl, media: cleanUrl });
         return;
     }
