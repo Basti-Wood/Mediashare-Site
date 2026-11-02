@@ -14,6 +14,7 @@ const { Server } = require('socket.io');
 const { createPlaylistImporter } = require('./playlist-imports');
 const { createMusicLibrary } = require('./music-library');
 const { createAudioSettings } = require('./audio-settings');
+const { createStreamDeckTokens, createStreamDeckCommands } = require('./streamdeck');
 const { FileSessionStore, persistentSessionSecret, REMEMBER_LOGIN_MS } = require('./session-store');
 
 const app    = express();
@@ -25,6 +26,7 @@ const audioSettings = createAudioSettings(process.env.AUDIO_SETTINGS_ROOT || pat
 const sessionDirectory = process.env.SESSION_STORE_ROOT || path.join(__dirname, '../..', 'data', 'sessions');
 const sessionSecret = process.env.SESSION_SECRET || persistentSessionSecret(sessionDirectory);
 const sessionStore = new FileSessionStore(sessionDirectory);
+const streamDeckTokens = createStreamDeckTokens(process.env.STREAMDECK_TOKENS_ROOT || path.join(__dirname, '../..', 'data', 'streamdeck'));
 const SESSION_COOKIE_NAME = 'mediashare.sid';
 const trustProxy = String(process.env.TRUST_PROXY ?? '1');
 app.set('trust proxy', /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy);
@@ -939,31 +941,87 @@ app.get('/api/channels/:ch/current', async (req, res) => {
 // Everything (owner songs included) now lives in the Basti queue, so advancing
 // is simply removing index 0 from Basti. In 'switch' mode we flip whose turn is
 // next so the following /current call promotes a My List song (or not).
-app.post('/api/channels/:ch/next', async (req, res) => {
-    const ch = req.params.ch;
+async function advancePlayback(ch, playbackId, onlyIfPlaying = false) {
     return withPlaybackLock(ch, async () => {
-        const modeData = loadChannelMode(ch);
-        const { mode } = modeData;
-
-        try {
-            // Multiple overlays can report the same finish. Old reports must not
-            // remove a newly promoted item (especially a one-song loop).
-            if (req.body.playbackId && req.body.playbackId !== playbackByChannel.get(ch)?.id)
-                return res.json({ success: true, advanced: false });
-            await bastiPost(`/removemedia/${ch}/0`);
-            personalListWaitByChannel.delete(ch);
-            playbackByChannel.delete(ch);
-            promotedMyListByChannel.delete(ch);
-            if (mode === 'switch') {
-                modeData.switchTurn = modeData.switchTurn === 'mylist' ? 'requests' : 'mylist';
-                saveChannelMode(ch, modeData);
-            }
-            io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
-            res.json({ success: true });
-        } catch {
-            res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
+        if (playbackId && playbackId !== playbackByChannel.get(ch)?.id)
+            return { success: true, advanced: false };
+        if (onlyIfPlaying) {
+            const current = await bastiGet(`/getallmedia/${encodeURIComponent(ch)}`);
+            if (!Array.isArray(current.media) || !current.media.length)
+                return { success: true, advanced: false };
         }
+        await bastiPost(`/removemedia/${encodeURIComponent(ch)}/0`);
+        personalListWaitByChannel.delete(ch);
+        playbackByChannel.delete(ch);
+        promotedMyListByChannel.delete(ch);
+        const modeData = loadChannelMode(ch);
+        if (modeData.mode === 'switch') {
+            modeData.switchTurn = modeData.switchTurn === 'mylist' ? 'requests' : 'mylist';
+            saveChannelMode(ch, modeData);
+        }
+        io.to(`ch:${ch}`).emit('queue:update', { channel: ch });
+        return { success: true, advanced: true };
     });
+}
+
+app.post('/api/channels/:ch/next', async (req, res) => {
+    try { res.json(await advancePlayback(req.params.ch, req.body.playbackId)); }
+    catch { res.status(502).json({ error: 'Could not reach api.bastiwood.com' }); }
+});
+
+// ── Stream Deck pairing and channel-scoped remote controls ─────────────────
+
+function streamDeckState(channel) {
+    return { channel, settings: audioSettings.get(channel), playbackId: playbackByChannel.get(channel)?.id || null };
+}
+const streamDeckCommand = createStreamDeckCommands({
+    audioSettings,
+    state: streamDeckState,
+    skip: (channel, playbackId) => advancePlayback(channel, playbackId, true),
+    onSettings: (channel, settings) => io.to(`ch:${channel}`).emit('audio:settings', { channel, settings })
+});
+
+function requireStreamDeck(req, res, next) {
+    res.setHeader('Cache-Control', 'no-store');
+    const connection = streamDeckTokens.find(req.get('authorization'));
+    if (!connection) return res.status(401).json({ error: 'Connect Stream Deck using a dashboard token.' });
+    let accounts;
+    try { accounts = loadAccounts(); }
+    catch { return res.status(503).json({ error: 'Cannot read accounts.' }); }
+    const account = accounts.find(item => item.username === connection.username);
+    if (!account || authenticationVersion(account) !== connection.authVersion)
+        return res.status(401).json({ error: 'Create a new Stream Deck token in the dashboard.' });
+    if (!hasAccess(sessionUser(account, accounts), connection.channel, accounts))
+        return res.status(403).json({ error: 'Channel access was removed.' });
+    req.streamDeckChannel = connection.channel;
+    next();
+}
+
+app.get('/api/streamdeck/:channel/connection', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel)) return res.status(403).json({ error: 'Access denied.' });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ connection: streamDeckTokens.status(req.session.user.username, req.params.channel) });
+});
+app.post('/api/streamdeck/:channel/connection', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel)) return res.status(403).json({ error: 'Access denied.' });
+    res.setHeader('Cache-Control', 'no-store');
+    try { res.status(201).json(streamDeckTokens.create(req.session.user.username, req.params.channel, req.session.authVersion)); }
+    catch { res.status(500).json({ error: 'Could not save the Stream Deck connection.' }); }
+});
+app.delete('/api/streamdeck/:channel/connection', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.channel)) return res.status(403).json({ error: 'Access denied.' });
+    try {
+        streamDeckTokens.revoke(req.session.user.username, req.params.channel);
+        res.json({ success: true });
+    } catch { res.status(500).json({ error: 'Could not disconnect Stream Deck.' }); }
+});
+app.get('/api/streamdeck/state', requireStreamDeck, (req, res) => res.json(streamDeckState(req.streamDeckChannel)));
+app.post('/api/streamdeck/control', requireStreamDeck, async (req, res) => {
+    try { res.json(await streamDeckCommand(req.streamDeckChannel, req.body)); }
+    catch (err) { res.status(err.status || 502).json({ error: err.status ? err.message : 'Could not control playback. Please try again.' }); }
+});
+app.get('/api/streamdeck/plugin', (_req, res) => {
+    res.download(path.join(__dirname, '../..', 'streamdeck', 'com.bastiwood.mediashare.streamDeckPlugin'));
 });
 
 // ── Webhook (api.bastiwood.com pushes new media to us) ───────────────────────

@@ -1,5 +1,39 @@
 # Mediashare
 
+## Stream Deck controls
+
+Open **Stream Deck** below the dashboard preview. Download the plugin and
+double-click the `.streamDeckPlugin` installer. In Stream Deck, drag **Skip
+current song** onto a key and **Media volume / Pause** onto a Stream Deck + dial.
+Create a connection token in the dashboard for the selected channel, then paste
+the website address and token into an action's settings and click **Connect**.
+The connection is shared by both actions and remembered by Stream Deck.
+
+- Press the Skip key to advance the current song.
+- Turn the dial clockwise/counterclockwise to raise/lower the app's media volume.
+  Each tick changes it by 2% by default; choose 1–10% in the dial settings.
+- Press the dial to pause the song, and press again to resume from its position.
+
+The dial display shows the current volume and paused state. Volume and playback
+settings stay synchronized with the dashboard, pop-out and OBS. This controls
+Mediashare audio, rather than the computer's master volume. Keep your player or
+OBS browser source running for playback.
+
+Requires Stream Deck 7.1 or newer on Windows 10+ or macOS 13+. Stream Deck runs the
+plugin using its bundled Node 24; installing Node separately is unnecessary for
+normal use. The website URL must use HTTPS, except HTTP localhost for development.
+
+**Replace connection token** invalidates the previous token. **Disconnect**
+revokes it immediately. Tokens are scoped to the selected channel, survive server
+restarts and stop working after an account password change, account deletion or
+removed channel access. Only token hashes are kept in `./data/streamdeck` under
+the existing persistent data mount; no website password is stored in the plugin.
+Keep `SESSION_SECRET` stable, as for remembered logins.
+
+The installer and source are in [streamdeck](streamdeck/README.md). Developers can
+rebuild the installer with `npm run streamdeck:pack`. After deploying this update,
+refresh the dashboard to load the Stream Deck pairing panel.
+
 ## Stay signed in
 
 Leave **Stay signed in for 30 days** checked when logging in. Your browser will

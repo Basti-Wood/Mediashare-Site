@@ -522,3 +522,34 @@ test('local playback preserves encoded filename characters in the audio URL', as
     assert.equal(ui.audios[0].src, '/api/local-media/alice/' + encodeURIComponent(name));
     assert.equal((await fetch(h.base + ui.audios[0].src)).status, 200);
 });
+
+test('Stream Deck changes pause and volume in the preview and anonymous OBS player', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const preview = frontend(h, 'overlay.js', h.cookie);
+    const obs = frontend(h, 'overlay.js');
+    await Promise.all([preview.ready, obs.ready]);
+    const playing = obs.run('currentItemId');
+    const token = (await h.api('/api/streamdeck/alice/connection', 'POST')).data.token;
+    async function command(body) {
+        const result = await h.request('/api/streamdeck/control', { method: 'POST',
+            body: { requestId: require('node:crypto').randomUUID(), ...body }, headers: { Authorization: 'Bearer ' + token } });
+        assert.equal(result.status, 200);
+        const update = h.events.filter(event => event.event === 'audio:settings').at(-1).payload;
+        preview.emitSocket('audio:settings', update);
+        obs.emitSocket('audio:settings', update);
+    }
+    await command({ action: 'adjust-volume', delta: -35 });
+    assert.equal(preview.run('volumePercent'), 65);
+    assert.equal(obs.run('volumePercent'), 65);
+    assert.equal(preview.audios[0].volume, 0.65 * preview.run('MAX_VOLUME'));
+    assert.equal(obs.audios[0].volume, 0.65 * obs.run('MAX_VOLUME'));
+    await command({ action: 'toggle-pause' });
+    assert.equal(preview.audios[0].paused, true);
+    assert.equal(obs.audios[0].paused, true);
+    assert.equal(obs.run('currentItemId'), playing);
+    await command({ action: 'toggle-pause' });
+    assert.equal(preview.audios[0].paused, false);
+    assert.equal(obs.audios[0].paused, false);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+});

@@ -67,6 +67,30 @@
                     keep playback alive in the background.
                 </p>
             </div>
+            <details class="box mt-3">
+                <summary class="has-text-weight-bold">Stream Deck</summary>
+                <ol class="mt-3 ml-4 is-size-7">
+                    <li><a href="/api/streamdeck/plugin" download>Download the Mediashare plugin</a> and double-click it to install.</li>
+                    <li>Drag <strong>Skip current song</strong> onto a key and <strong>Media volume / Pause</strong> onto a Stream Deck + dial.</li>
+                    <li>Create a token below, paste the website address and token into an action's settings, and click <strong>Connect</strong>.</li>
+                </ol>
+                <p class="is-size-7 mt-2 mb-3">Turn the dial to adjust volume. Press to pause the song; press again to resume. Pairing applies to the selected channel. Requires Stream Deck 7.1 or newer.</p>
+                <label class="label is-small" for="streamdeck-site-url">Website address</label>
+                <input id="streamdeck-site-url" class="input is-small mb-3" type="url" readonly>
+                <div class="buttons are-small mb-2">
+                    <button id="streamdeck-create" class="button is-link" type="button" disabled>Create connection token</button>
+                    <button id="streamdeck-revoke" class="button is-danger is-outlined" type="button" disabled>Disconnect</button>
+                </div>
+                <div id="streamdeck-token-wrap" hidden>
+                    <label class="label is-small" for="streamdeck-token">Connection token</label>
+                    <div class="field has-addons">
+                        <div class="control is-expanded"><input id="streamdeck-token" class="input is-small" type="password" autocomplete="off" readonly></div>
+                        <div class="control"><button id="streamdeck-copy" class="button is-small is-info" type="button" disabled>Copy token</button></div>
+                    </div>
+                </div>
+                <p id="streamdeck-status" class="is-size-7 mb-1" role="status" aria-live="polite"></p>
+                <p class="is-size-7 has-text-grey">Replacing a token disconnects its previous copy. Disconnect revokes it immediately.</p>
+            </details>
         </div>
 
         <!-- Right: queue -->
@@ -307,6 +331,7 @@
 
     <!-- Socket.io client -->
     <script src="/socket.io/socket.io.js"></script>
-    <script src="../scrs/frontend/main.js?v=saved-playlists-1"></script>
+    <script src="../scrs/frontend/streamdeck.js?v=streamdeck-1"></script>
+    <script src="../scrs/frontend/main.js?v=streamdeck-1"></script>
 </body>
 </html>

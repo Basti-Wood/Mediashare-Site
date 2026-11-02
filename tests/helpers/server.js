@@ -29,7 +29,7 @@ async function createTestServer(options = {}) {
         __dirname: path.dirname(serverFile),
         process: { env: { SESSION_SECRET: 'test-only', BASTI_POLLING_ONLY: 'true', LOCAL_MEDIA_ROOT: localRoot,
             AUDIO_SETTINGS_ROOT: path.join(localRoot, '.audio-settings'),
-            SESSION_STORE_ROOT: path.join(localRoot, '.sessions'), ...options.env } },
+            SESSION_STORE_ROOT: path.join(localRoot, '.sessions'), STREAMDECK_TOKENS_ROOT: path.join(localRoot, '.streamdeck'), ...options.env } },
         console: { log() {}, warn() {}, error() {} },
         Buffer, URL, URLSearchParams, setTimeout, clearTimeout, setInterval, clearInterval,
         Math: Object.assign(Object.create(Math), { random: options.random || Math.random }),

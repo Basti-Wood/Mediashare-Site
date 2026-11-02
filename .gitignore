@@ -5,3 +5,5 @@ node_modules/
 /data/audio-settings/
 /data/sessions/
 /tests/.tmp-*/
+
+/data/streamdeck/

@@ -956,6 +956,7 @@ function switchChannel(channel) {
     if (socket && currentChannel) socket.emit('leave:channel', currentChannel);
 
     currentChannel = channel;
+    window.mediashareStreamDeck?.setChannel(channel);
     renderChannelPause({ paused: false });
     pauseCurrentBtn.disabled = true;
     renderLoopButton(false);
