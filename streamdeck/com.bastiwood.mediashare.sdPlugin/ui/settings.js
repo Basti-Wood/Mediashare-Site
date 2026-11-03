@@ -35,9 +35,9 @@ window.connectElgatoStreamDeckSocket = (port, uuid, registerEvent, _info, action
 };
 
 field('connect').addEventListener('click', () => {
-    const step = Number(field('step').value);
-    if (!Number.isInteger(step) || step < 1 || step > 10) {
-        field('status').textContent = 'Choose a whole number from 1 to 10 for volume per tick.';
+    const step = Number(String(field('step').value).replace(',', '.'));
+    if (!Number.isFinite(step) || step < 0.01 || step > 10) {
+        field('status').textContent = 'Choose a number from 0.01 to 10 for volume per tick.';
         return;
     }
     field('connect').disabled = true;

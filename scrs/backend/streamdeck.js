@@ -69,7 +69,7 @@ function createStreamDeckCommands({ audioSettings, skip, state, onSettings, now 
             || typeof command.requestId !== 'string'
             || !/^[A-Za-z0-9_-]{8,80}$/.test(command.requestId || '')
             || !['skip', 'adjust-volume', 'toggle-pause'].includes(command.action)
-            || (command.action === 'adjust-volume' && (!Number.isInteger(command.delta) || Math.abs(command.delta) > 100 || command.delta === 0))
+            || (command.action === 'adjust-volume' && (typeof command.delta !== 'number' || !Number.isFinite(command.delta) || Math.abs(command.delta) > 100 || command.delta === 0))
             || (command.playbackId !== undefined && command.playbackId !== null && typeof command.playbackId !== 'string'))
             throw failure('Use a valid requestId and skip, adjust-volume or toggle-pause action.');
         const key = JSON.stringify([channel, command.requestId]);
@@ -91,7 +91,7 @@ function createStreamDeckCommands({ audioSettings, skip, state, onSettings, now 
             } else {
                 const current = audioSettings.get(channel);
                 const changes = command.action === 'toggle-pause' ? { paused: !current.paused }
-                    : { volume: Math.max(0, Math.min(100, current.volume + command.delta)) };
+                    : { volume: Math.max(0, Math.min(100, Number((current.volume + command.delta).toFixed(4)))) };
                 const settings = audioSettings.update(channel, changes);
                 onSettings(channel, settings);
             }

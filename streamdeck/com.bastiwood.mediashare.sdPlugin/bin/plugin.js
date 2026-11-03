@@ -47,7 +47,7 @@ function createPlugin({ send, pluginUUID, fetcher = fetch, requestId = randomUUI
             if (action.action === VOLUME) {
                 send({ event: 'setFeedback', context, payload: {
                     title: error ? 'Check connection' : state?.settings.paused ? 'Paused' : state?.channel || 'Volume',
-                    value: error ? '—' : `${Math.round(state?.settings.volume ?? 100)}%`,
+                    value: error ? '—' : `${Number((state?.settings.volume ?? 100).toFixed(4))}%`,
                     indicator: error ? 0 : state?.settings.volume ?? 100,
                     icon: 'images/volume.svg'
                 } });
@@ -90,7 +90,7 @@ function createPlugin({ send, pluginUUID, fetcher = fetch, requestId = randomUUI
             && previous.generation === generation && Math.sign(previous.command.delta) === Math.sign(command.delta)) {
             // Merge only equal directions; a reversal at 0/100 must retain its
             // order. Commands already on the wire are never modified/retried.
-            previous.command.delta = Math.sign(command.delta) * Math.min(100, Math.abs(previous.command.delta + command.delta));
+            previous.command.delta = Math.sign(command.delta) * Math.min(100, Math.abs(Number((previous.command.delta + command.delta).toFixed(4))));
         } else queue.push({ command: { requestId: requestId(), ...command }, context, generation });
         if (!working) {
             working = true;
@@ -136,11 +136,12 @@ function createPlugin({ send, pluginUUID, fetcher = fetch, requestId = randomUUI
             if (action) action.settings = payload.settings || {};
         } else if (message.event === 'keyDown' && message.action === SKIP) {
             await enqueue({ action: 'skip' }, message.context);
-        } else if (message.event === 'dialDown' && message.action === VOLUME) {
+        } else if ((message.event === 'dialDown' || message.event === 'touchTap') && message.action === VOLUME) {
             await enqueue({ action: 'toggle-pause' }, message.context);
         } else if (message.event === 'dialRotate' && message.action === VOLUME && Number.isInteger(payload.ticks) && payload.ticks !== 0) {
             const setting = payload.settings?.step ?? actions.get(message.context)?.settings.step;
-            const step = Number.isInteger(Number(setting)) && Number(setting) >= 1 && Number(setting) <= 10 ? Number(setting) : 2;
+            const parsedStep = Number(String(setting).replace(',', '.'));
+            const step = Number.isFinite(parsedStep) && parsedStep >= 0.01 && parsedStep <= 10 ? parsedStep : 2;
             await enqueue({ action: 'adjust-volume', delta: Math.sign(payload.ticks) * Math.min(100, Math.abs(payload.ticks * step)) }, message.context);
         } else if (message.event === 'sendToPlugin' && payload.command === 'connect') {
             try {

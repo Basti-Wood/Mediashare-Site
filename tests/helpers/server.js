@@ -56,7 +56,7 @@ async function createTestServer(options = {}) {
                     return server;
                 }
             };
-            if (name === 'socket.io') return {
+            if (name === 'socket.io' && !options.realSockets) return {
                 Server: class {
                     on() {}
                     to(room) { return { emit: (event, payload) => events.push({ room, event, payload }) }; }
@@ -95,8 +95,8 @@ async function createTestServer(options = {}) {
             return { ok: true, json: async () => ({ success: true }) };
         }
     };
-    const { playlistImporter, sessionStore } = vm.runInNewContext(
-        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter, sessionStore });', sandbox, { filename: serverFile });
+    const { playlistImporter, sessionStore, io } = vm.runInNewContext(
+        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter, sessionStore, io });', sandbox, { filename: serverFile });
     server.listen = listen;
     await new Promise(resolve => listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
@@ -129,7 +129,8 @@ async function createTestServer(options = {}) {
                 await playlistImporter.settle(channel);
             }
             server.closeAllConnections();
-            await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+            if (options.realSockets) await new Promise(resolve => io.close(resolve));
+            else await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
             await sessionStore.close();
             if (!options.preserveData) fs.rmSync(localRoot, { recursive: true, force: true });
         }

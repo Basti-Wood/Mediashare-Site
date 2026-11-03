@@ -2,36 +2,6 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <!--
-      Background-tab pause fix — MUST be the first script in <head>.
-      A background tab reports document.visibilityState === "hidden". The
-      cross-origin YouTube iframe reads the TOP document's visibility and pauses
-      its media when hidden, which is what stopped playback when this page wasn't
-      the active tab. We can't touch the cross-origin iframe's audio, so we pin
-      the page to always *report* itself visible. This runs before the YouTube
-      iframe_api script so YouTube's own visibility listener only ever sees
-      "visible". overlay.js re-asserts this defensively and also suppresses the
-      visibilitychange event. The real OS tab state is unchanged; only the
-      JS-observable signal is overridden.
-    -->
-    <script>
-        (function () {
-            try {
-                Object.defineProperty(document, 'visibilityState', {
-                    configurable: true, get: function () { return 'visible'; }
-                });
-                Object.defineProperty(document, 'hidden', {
-                    configurable: true, get: function () { return false; }
-                });
-                document.addEventListener('visibilitychange', function (e) {
-                    e.stopImmediatePropagation();
-                }, true);
-                window.addEventListener('visibilitychange', function (e) {
-                    e.stopImmediatePropagation();
-                }, true);
-            } catch (err) { /* non-fatal */ }
-        })();
-    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mediashare Overlay</title>
     <style>
@@ -48,25 +18,25 @@
             width: 100%;
             height: 100%;
             position: relative;
-            background: #000;
+            background: transparent;
         }
 
-        /* YouTube div / iframe fills the entire container */
-        #yt-player {
+        #audio-card {
             position: absolute;
-            top: 0; left: 0; right: 0; bottom: 0;
-            width: 100%;
-            height: 100%;
-            border: none;
+            inset: 0 0 82px;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            gap: 10px;
+            color: #fff;
+            text-align: center;
+            font-family: 'Segoe UI', sans-serif;
         }
-        /* The YouTube IFrame API injects an <iframe> in here — force it to fill. */
-        #yt-player iframe {
-            position: absolute;
-            top: 0; left: 0;
-            width: 100% !important;
-            height: 100% !important;
-            border: none;
-        }
+        #audio-card[hidden] { display: none; }
+        #audio-card p { color: #9aa4b8; font-size: .8rem; }
+        #audio-title { font-size: 1.15rem; font-weight: 600; overflow-wrap: anywhere; }
 
         /* Spotify embed */
         #spotify-player {
@@ -77,7 +47,7 @@
             border: none;
         }
 
-        /* Media controls bar — overlays on top of the video, doesn't shrink it */
+        /* Shared audio controls */
         #player-controls {
             display: none;
             flex-direction: column;
@@ -182,8 +152,10 @@
 <body>
     <div id="player-container">
         <div id="idle-screen">Waiting for media…</div>
-        <!-- YouTube player target -->
-        <div id="yt-player" style="display:none"><div id="yt-player-mount"></div></div>
+        <div id="audio-card" hidden>
+            <p>Now playing</p>
+            <h1 id="audio-title"></h1>
+        </div>
         <!-- Spotify embed target -->
         <iframe id="spotify-player"
                 style="display:none"
@@ -207,9 +179,9 @@
             <div class="ctrl-row">
                 <button id="pause-resume-btn" type="button" aria-pressed="false">⏸ Pause</button>
                 <span class="ctrl-icon">&#128266;</span>
-                <input type="range" id="volume-bar" min="0" max="100" value="100" step="0.1" aria-label="Volume">
+                <input type="range" id="volume-bar" min="0" max="100" value="100" step="0.01" aria-label="Volume">
                 <label class="volume-value">
-                    <input type="number" id="volume-percent" min="0" max="100" value="100" step="0.1" inputmode="decimal" aria-label="Volume percentage">
+                    <input type="text" id="volume-percent" value="100" inputmode="decimal" aria-label="Volume percentage from 0 to 100" spellcheck="false">
                     <span>%</span>
                 </label>
             </div>
@@ -218,8 +190,6 @@
 
     <!-- Socket.io client -->
     <script src="/socket.io/socket.io.js"></script>
-    <!-- YouTube IFrame API -->
-    <script src="https://www.youtube.com/iframe_api"></script>
-    <script src="../scrs/frontend/overlay.js?v=saved-playlists-1"></script>
+    <script src="../scrs/frontend/overlay.js?v=audio-output-2"></script>
 </body>
 </html>

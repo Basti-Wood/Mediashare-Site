@@ -137,7 +137,7 @@ test('dial commands adjust the latest volume, clamp boundaries and broadcast sha
 test('invalid commands are rejected without changing settings', async t => {
     const h = await setup(t);
     for (const body of [{ action: 'erase-files' }, { action: 'adjust-volume', delta: 0 }, { action: 'adjust-volume', delta: 101 },
-        { action: 'adjust-volume', delta: '2' }, { action: 'adjust-volume', delta: 1.5 }, { action: 'toggle-pause', requestId: '' }])
+        { action: 'adjust-volume', delta: '2' }, { action: 'adjust-volume', delta: null }, { action: 'toggle-pause', requestId: '' }])
         assert.equal((await h.control(body)).status, 400);
     assert.deepEqual((await h.state()).data.settings, { volume: 100, paused: false });
 });
@@ -380,4 +380,51 @@ test('the dashboard serves a public installer and blocks private connection file
     const file = fs.readdirSync(path.join(h.localRoot, '.streamdeck'))[0];
     for (const route of ['/data/streamdeck/' + file, '/%64ata/streamdeck/' + file])
         assert.equal((await fetch(h.base + route)).status, 403);
+});
+
+test('touch-screen taps and holds toggle playback exactly like a dial press', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const playing = await h.current();
+    const ui = await pluginFor(h);
+    await ui.fire('touchTap', { hold: false, tapPos: [50, 50] });
+    assert.equal((await h.state()).data.settings.paused, true);
+    await ui.fire('touchTap', { hold: true, tapPos: [50, 50] });
+    assert.equal((await h.state()).data.settings.paused, false);
+    await ui.fire('dialDown');
+    assert.equal((await h.state()).data.settings.paused, true);
+    assert.equal((await h.current())._playbackId, playing._playbackId);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+});
+
+test('fractional dial steps preserve and display 0.5% without rounding it to 1%', async t => {
+    const h = await setup(t);
+    await h.api('/api/channels/alice/audio-settings', 'POST', { volume: 1 });
+    const ui = await pluginFor(h);
+    await ui.fire('dialRotate', { ticks: -1, settings: { step: 0.5 } });
+    assert.equal((await h.state()).data.settings.volume, 0.5);
+    assert.equal(ui.sent.filter(message => message.event === 'setFeedback').at(-1).payload.value, '0.5%');
+    await h.api('/api/channels/alice/audio-settings', 'POST', { volume: 0 });
+    for (let i = 0; i < 3; i++) await ui.fire('dialRotate', { ticks: 1, settings: { step: 0.1 } });
+    assert.equal((await h.state()).data.settings.volume, 0.3);
+    assert.equal(ui.sent.filter(message => message.event === 'setFeedback').at(-1).payload.value, '0.3%');
+});
+
+test('real Socket.IO subscribers receive fractional volume and pause revisions from Stream Deck', { timeout: 10000 }, async t => {
+    const h = await setup(t, { realSockets: true });
+    const clientBundle = path.join(path.dirname(require.resolve('socket.io/package.json')), 'client-dist/socket.io.js');
+    const { io } = require(clientBundle);
+    const client = io(h.base, { transports: ['websocket'], reconnection: false });
+    t.after(() => client.disconnect());
+    const updates = [];
+    let joined = false;
+    client.on('audio:settings', update => updates.push(update));
+    client.on('queue:update', () => { joined = true; });
+    client.on('connect', () => client.emit('join:channel', 'alice'));
+    await until(() => joined);
+    await h.control({ action: 'adjust-volume', delta: -99.5 });
+    await h.control({ action: 'toggle-pause' });
+    await until(() => updates.length === 2);
+    assert.deepEqual(updates.map(update => update.settings), [{ volume: 0.5, paused: false }, { volume: 0.5, paused: true }]);
+    assert.deepEqual(updates.map(update => update.revision), [1, 2]);
 });

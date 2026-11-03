@@ -2,7 +2,7 @@
 
 ## Stream Deck controls
 
-Open **Stream Deck** below the dashboard preview. Download the plugin and
+Open **Stream Deck** below the audio player. Download the plugin and
 double-click the `.streamDeckPlugin` installer. In Stream Deck, drag **Skip
 current song** onto a key and **Media volume / Pause** onto a Stream Deck + dial.
 Create a connection token in the dashboard for the selected channel, then paste
@@ -11,8 +11,8 @@ The connection is shared by both actions and remembered by Stream Deck.
 
 - Press the Skip key to advance the current song.
 - Turn the dial clockwise/counterclockwise to raise/lower the app's media volume.
-  Each tick changes it by 2% by default; choose 1–10% in the dial settings.
-- Press the dial to pause the song, and press again to resume from its position.
+  Each tick changes it by 2% by default; choose 0.01–10% in the dial settings.
+- Press the dial or tap its touch screen to pause; press or tap again to resume.
 
 The dial display shows the current volume and paused state. Volume and playback
 settings stay synchronized with the dashboard, pop-out and OBS. This controls
@@ -32,7 +32,9 @@ Keep `SESSION_SECRET` stable, as for remembered logins.
 
 The installer and source are in [streamdeck](streamdeck/README.md). Developers can
 rebuild the installer with `npm run streamdeck:pack`. After deploying this update,
-refresh the dashboard to load the Stream Deck pairing panel.
+refresh the dashboard to load the Stream Deck pairing panel. Install plugin
+**1.0.1** to add touch-screen pause/resume and fractional dial sensitivity;
+existing connection tokens are retained.
 
 ## Stay signed in
 
@@ -96,36 +98,42 @@ known filename for the current song.
 Metadata lookup and live YouTube audio playback use `yt-dlp`; `ffmpeg` normalizes
 uploaded MP3s and the live audio stream. The existing Docker image includes both
 and Node 24. Refresh the dashboard and OBS browser source after updating; both
-scripts are versioned `saved-playlists-1`.
+scripts are versioned `audio-output-2`.
 
 ## If songs immediately skip or audio returns 502
 
-Audio loading failures keep the current song queued. A failed YouTube audio
-proxy switches to YouTube's embedded player; failed MP3 or embedded playback
-shows **Play / Retry** and **Skip this song**. Only a completed song or an
-explicit Skip advances the queue. Autoplay permission failures ask for a click.
+Audio loading failures keep the current song queued and show **Play / Retry**
+and **Skip this song**. Only a completed song or an explicit Skip advances the
+queue. YouTube playback is audio-only through the same native audio output as
+uploaded MP3s; no YouTube video widget, iframe API or iframe fallback is loaded.
+Autoplay permission failures ask for a click.
 
 ## Saved volume and shared Pause/Resume
 
 Volume and paused state are saved for each user's channel and restored before
 playback starts. They survive page reloads and server restarts, and are shared
 by the dashboard preview, pop-out and OBS player. Use **Pause / Resume** on the
-dashboard or the player's controls. Pausing the YouTube picture also pauses its
-native audio stream; it no longer leaves the sound playing separately.
+dashboard, the audio controls or Stream Deck. A saved volume of **0.5%** maps to
+linear signal gain **0.005**, half the gain of **1%** (**0.01**). The old hidden
+50% output cap is removed. Decimal dots and commas work in the percentage field;
+the dial display preserves fractional values and its step can be set to 0.5%.
+A short 5 ms gain ramp avoids clicks when changing volume. YouTube audio and MP3s
+share this output; Spotify embeds retain their own volume controls.
+
+Versioned settings keep Stream Deck, dashboard and OBS in sync even during local
+saves: a pending volume save does not discard Pause, and older acknowledgements
+cannot overwrite newer settings. Song duration comes from cached audio metadata,
+without a YouTube video player.
 
 Change settings from a signed-in dashboard or pop-out. OBS can read and follow
 the saved settings without logging in. Each channel's preferences are separate;
 moderators with access to a channel can adjust that channel's audio. Settings
 live in `./data/audio-settings` under the same persistent data mount as MP3s.
 
-For an older deployed version, append `&ytmode=iframe` to the existing overlay
-URL as a temporary way to bypass the audio proxy. The permanent fix also updates
-the resolver, retains its HTTP headers, and removes stale stream URLs on failure.
-
 If the Local Music playlist form is missing, verify that the feature pull request
 has been merged and that your deployment has pulled that revision. Refresh the
 dashboard and OBS browser source after updating. The updated overlay script is
-versioned `saved-playlists-1`.
+versioned `audio-output-2`.
 
 ## Update an existing Docker installation
 
@@ -146,7 +154,10 @@ docker compose build --pull --no-cache
 docker compose up -d
 ```
 
-Refresh the dashboard afterward. Uploaded MP3s and saved playlists live in
+Refresh the dashboard and OBS source afterward. Download and install the updated
+Stream Deck plugin from the dashboard. The `streamdeck` folder is now mounted
+alongside the source so future installer updates stay in sync with the site.
+Uploaded MP3s and saved playlists live in
 `./data/local-media` on the host and survive container recreation. My List is
 also persisted there; play-mode and loop settings still use in-memory storage.
 The uncached rebuild is needed to install the newer Node runtime and refresh

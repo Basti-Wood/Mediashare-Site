@@ -4,7 +4,7 @@
   "Name": "Mediashare",
   "Author": "Basti-Wood",
   "Description": "Skip songs and control Mediashare volume and playback from Stream Deck.",
-  "Version": "1.0.0.0",
+  "Version": "1.0.1.0",
   "SDKVersion": 2,
   "CodePath": "bin/plugin.js",
   "Nodejs": {
@@ -48,7 +48,7 @@
     {
       "UUID": "com.bastiwood.mediashare.volume",
       "Name": "Media volume / Pause",
-      "Tooltip": "Turn to adjust media volume. Press to pause or resume the song.",
+      "Tooltip": "Turn to adjust media volume. Press the dial or tap the touch screen to pause/resume.",
       "Icon": "images/volume",
       "Controllers": [
         "Encoder"
@@ -58,7 +58,9 @@
         "Icon": "images/volume",
         "TriggerDescription": {
           "Rotate": "Adjust media volume",
-          "Push": "Pause / resume song"
+          "Push": "Pause / resume song",
+          "Touch": "Pause / resume song",
+          "LongTouch": "Pause / resume song"
         }
       },
       "States": [

@@ -12,12 +12,14 @@ const { createDownloader } = require('./helpers/downloader');
 // Exercise the real frontend event handlers against the real local API.
 // Minimal DOM/audio stand-ins keep this suite runnable without a browser or
 // live media services; these checks do not claim to verify visual layout.
-function frontend(h, file, cookie) {
+function frontend(h, file, cookie, options = {}) {
     const elements = new Map();
     const errors = [];
     const audios = [];
     const plays = [];
-    const youtubePlayers = [];
+    const outputs = [];
+    const windowHandlers = new Map();
+    const documentHandlers = new Map();
     const socketHandlers = new Map();
     function element(id) {
         if (!elements.has(id)) elements.set(id, {
@@ -40,39 +42,25 @@ function frontend(h, file, cookie) {
     });
     element('queue-type-tabs').querySelectorAll = () => tabs;
     const context = vm.createContext({
-        document: { getElementById: element, addEventListener() {}, visibilityState: 'visible', hidden: false },
-        window: { location: { origin: h.base, search: '?channel=alice&controls=1', href: '' }, addEventListener() {} },
+        document: { getElementById: element, addEventListener(event, handler) { documentHandlers.set(event, handler); }, visibilityState: 'visible', hidden: false },
+        window: { location: { origin: h.base, search: options.search || '?channel=alice&controls=1', href: '' },
+            addEventListener(event, handler) { windowHandlers.set(event, handler); },
+            ...(options.audioContext === false ? {} : { AudioContext: class {
+                constructor() { this.state = options.suspended ? 'suspended' : 'running'; this.currentTime = 0; this.destination = {}; outputs.push(this); }
+                createGain() { this.gain = { value: 1, cancelScheduledValues() {}, setValueAtTime(value) { this.value = value; }, linearRampToValueAtTime(value) { this.value = value; } };
+                    return { gain: this.gain, connect: target => { this.destinationTarget = target; this.levelAtConnect = this.gain.value; } }; }
+                createMediaElementSource(audio) { this.audio = audio; this.sourceCount = (this.sourceCount || 0) + 1; return { connect: target => { this.sourceTarget = target; } }; }
+                resume() { if (!options.blockResume) this.state = 'running'; return Promise.resolve(); }
+            } }) },
         navigator: {}, URLSearchParams, FormData, Blob,
         console: { log() {}, warn() {}, error: (...args) => errors.push(args) },
         setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 1; }, clearInterval() {},
         io: () => ({ on(event, handler) { socketHandlers.set(event, handler); }, emit() {} }),
-        YT: {
-            PlayerState: { ENDED: 0, PLAYING: 1, PAUSED: 2 },
-            Player: class {
-                constructor(target, options) {
-                    this.target = target;
-                    this.options = options;
-                    this.muted = true;
-                    youtubePlayers.push(this);
-                }
-                mute() { this.muted = true; }
-                unMute() { this.muted = false; }
-                setVolume(value) { this.volume = value; }
-                playVideo() { this.playing = true; this.paused = false; }
-                pauseVideo() { this.playing = false; this.paused = true; }
-                loadVideoById(id) { this.videoId = id; }
-                destroy() { this.destroyed = true; }
-                fire(name, data) {
-                    if (name === 'onStateChange' && (data === 1 || data === 2)) this.paused = data === 2;
-                    return this.options.events[name]?.({ target: this, data });
-                }
-            }
-        },
-        fetch: (url, options = {}) => fetch(h.base + url, {
-            ...options, headers: { ...options.headers, ...(cookie ? { Cookie: cookie } : {}) }
-        }),
+        fetch: (url, request = {}) => /\/api\/yt-audio\/[A-Za-z0-9_-]{11}\/info$/.test(url)
+            ? Promise.resolve(new Response(JSON.stringify({ duration: 180 }), { headers: { 'Content-Type': 'application/json' } }))
+            : fetch(h.base + url, { ...request, headers: { ...request.headers, ...(cookie ? { Cookie: cookie } : {}) } }),
         Audio: class {
-            constructor() { this.src = ''; this.paused = true; this.handlers = new Map(); audios.push(this); }
+            constructor() { this.src = ''; this.paused = true; this.currentTime = 0; this.duration = NaN; this.handlers = new Map(); audios.push(this); }
             addEventListener(event, handler) { this.handlers.set(event, handler); }
             play() { this.paused = false; plays.push(this.src); return Promise.resolve(); }
             pause() { this.paused = true; }
@@ -82,7 +70,7 @@ function frontend(h, file, cookie) {
     });
     const source = fs.readFileSync(path.resolve(__dirname, '../scrs/frontend', file), 'utf8');
     const ready = vm.runInContext(source, context, { filename: file });
-    return { context, elements, errors, audios, plays, youtubePlayers, ready,
+    return { context, elements, errors, audios, plays, outputs, windowHandlers, documentHandlers, ready,
         emitSocket: (event, payload) => socketHandlers.get(event)?.(payload),
         run: code => vm.runInContext(code, context) };
 }
@@ -274,51 +262,35 @@ test('overlay ignores a stale current response arriving after advancement', asyn
     assert.deepEqual(ui.errors, []);
 });
 
-test('failed audio proxy falls back to audible YouTube playback without consuming the song', async t => {
+test('a failed YouTube audio stream stays queued and never creates a video player', async t => {
     const h = await setup(t);
     await h.add('AAAAAAAAAAA');
     const ui = frontend(h, 'overlay.js');
     await ui.ready;
-    ui.context.window.onYouTubeIframeAPIReady();
-    const picture = ui.youtubePlayers.at(-1);
-    picture.fire('onReady');
-    assert.equal(picture.muted, true);
     const id = ui.run('currentItemId');
     ui.audios[0].handlers.get('error')();
-    const audible = ui.youtubePlayers.at(-1);
-    assert.notEqual(audible, picture);
-    assert.equal(picture.destroyed, true);
-    audible.fire('onReady');
-    assert.equal(audible.muted, false);
-    assert.equal(audible.target, 'yt-player-mount');
-    assert.equal(ui.run('playbackMode'), 'youtube');
+    assert.equal(ui.run('playbackMode'), 'youtube-audio');
     assert.equal(ui.run('currentItemId'), id);
     assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
-    // Muted picture events and failed iframe loads must not skip either.
-    picture.fire('onStateChange', 0);
-    audible.fire('onError', 100);
-    await nextTick();
-    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
-    assert.match(ui.elements.get('playback-message').textContent, /could not play/);
+    assert.match(ui.elements.get('playback-message').textContent, /YouTube audio could not be loaded/);
+    assert.equal(ui.context.window.onYouTubeIframeAPIReady, undefined);
+    await ui.elements.get('playback-retry-btn').fire('click');
+    assert.equal(ui.plays.length, 2);
     await ui.elements.get('playback-skip-btn').fire('click');
     await until(() => h.calls.some(call => call.action === 'removemedia'));
     assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
 });
 
-test('late iframe API arrival does not reload native audio and only audible playback endings advance', async t => {
+test('legacy iframe parameters still use one native audio output and only its ending advances', async t => {
     const h = await setup(t);
     await h.add('AAAAAAAAAAA');
-    const ui = frontend(h, 'overlay.js');
+    const ui = frontend(h, 'overlay.js', undefined, { search: '?channel=alice&controls=1&ytmode=iframe' });
     await ui.ready;
+    assert.equal(ui.run('playbackMode'), 'youtube-audio');
     assert.equal(ui.plays.length, 1);
-    ui.context.window.onYouTubeIframeAPIReady();
-    assert.equal(ui.plays.length, 1);
-    ui.youtubePlayers.at(-1).fire('onStateChange', 0);
-    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
-    ui.audios[0].handlers.get('error')();
-    const player = ui.youtubePlayers.at(-1);
-    player.fire('onReady');
-    player.fire('onStateChange', 0);
+    assert.equal(ui.outputs.length, 1);
+    assert.equal(ui.outputs[0].sourceCount, 1);
+    ui.audios[0].handlers.get('ended')();
     await until(() => h.calls.some(call => call.action === 'removemedia'));
     assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
 });
@@ -364,7 +336,8 @@ test('volume is restored per user channel and saved after editing the player con
     const ui = frontend(h, 'overlay.js', h.cookie);
     await ui.ready;
     assert.equal(ui.run('volumePercent'), 23.5);
-    assert.equal(ui.audios[0].volume, 23.5 / 100 * 0.5);
+    assert.equal(ui.audios[0].volume, 1);
+    assert.equal(ui.outputs[0].gain.value, 0.235);
     assert.equal(ui.elements.get('volume-percent').value, 23.5);
     ui.elements.get('volume-percent').value = '37.5';
     await ui.elements.get('volume-percent').fire('change');
@@ -399,30 +372,13 @@ test('restored pause prevents autoplay and Pause/Resume controls the native audi
     assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
 });
 
-test('pausing the muted YouTube picture pauses native audio and persists the shared state', async t => {
-    const h = await setup(t);
-    await h.add('AAAAAAAAAAA');
-    const ui = frontend(h, 'overlay.js', h.cookie);
-    await ui.ready;
-    ui.context.window.onYouTubeIframeAPIReady();
-    const player = ui.youtubePlayers.at(-1);
-    player.fire('onReady');
-    player.fire('onStateChange', 1);
-    player.fire('onStateChange', 2);
-    await ui.run('audioSettingsWrite');
-    assert.equal(ui.audios[0].paused, true);
-    assert.equal(player.paused, true);
-    assert.equal((await h.api('/api/channels/alice/audio-settings')).data.settings.paused, true);
-    player.fire('onStateChange', 2); // acknowledge the shared pause
-    player.fire('onStateChange', 1); // user resumes using the video controls
-    await ui.run('audioSettingsWrite');
-    assert.equal(ui.audios[0].paused, false);
-    assert.equal((await h.api('/api/channels/alice/audio-settings')).data.settings.paused, false);
-    player.fire('onStateChange', 2); // an immediate second pause must also work
-    await ui.run('audioSettingsWrite');
-    assert.equal(ui.audios[0].paused, true);
-    assert.equal((await h.api('/api/channels/alice/audio-settings')).data.settings.paused, true);
-    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+test('audio-only controls work without loading YouTube scripts, iframe mounts or visibility shims', () => {
+    const html = fs.readFileSync(path.resolve(__dirname, '../HTML/overlay.html'), 'utf8');
+    assert.equal(html.includes('youtube.com/iframe_api'), false);
+    assert.equal(html.includes('id="yt-player"'), false);
+    assert.equal(html.includes('Object.defineProperty(document'), false);
+    assert.match(html, /id="audio-card"/);
+    assert.match(html, /id="audio-title"/);
 });
 
 test('dashboard pause broadcasts to both preview and anonymous OBS without changing the song', async t => {
@@ -542,8 +498,10 @@ test('Stream Deck changes pause and volume in the preview and anonymous OBS play
     await command({ action: 'adjust-volume', delta: -35 });
     assert.equal(preview.run('volumePercent'), 65);
     assert.equal(obs.run('volumePercent'), 65);
-    assert.equal(preview.audios[0].volume, 0.65 * preview.run('MAX_VOLUME'));
-    assert.equal(obs.audios[0].volume, 0.65 * obs.run('MAX_VOLUME'));
+    assert.equal(preview.audios[0].volume, 1);
+    assert.equal(obs.audios[0].volume, 1);
+    assert.equal(preview.outputs[0].gain.value, 0.65);
+    assert.equal(obs.outputs[0].gain.value, 0.65);
     await command({ action: 'toggle-pause' });
     assert.equal(preview.audios[0].paused, true);
     assert.equal(obs.audios[0].paused, true);
@@ -552,4 +510,169 @@ test('Stream Deck changes pause and volume in the preview and anonymous OBS play
     assert.equal(preview.audios[0].paused, false);
     assert.equal(obs.audios[0].paused, false);
     assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+});
+
+test('fractional volume uses one linear gain and accepts decimal commas', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const ui = frontend(h, 'overlay.js', h.cookie);
+    await ui.ready;
+    const input = ui.elements.get('volume-percent');
+    input.value = '1';
+    await input.fire('change');
+    await ui.run('flushAudioSettings()');
+    const one = ui.outputs[0].gain.value;
+    input.value = '0,5';
+    await input.fire('change');
+    await ui.run('flushAudioSettings()');
+    assert.equal(ui.outputs[0].gain.value, one / 2);
+    assert.equal(ui.outputs[0].gain.value, 0.005);
+    assert.equal(ui.audios[0].volume, 1);
+    assert.equal((await h.api('/api/channels/alice/audio-settings')).data.settings.volume, 0.5);
+    await h.add('BBBBBBBBBBB');
+    await ui.run('advance()');
+    await until(() => ui.plays.length === 2);
+    assert.equal(ui.outputs.length, 1);
+    assert.equal(ui.outputs[0].sourceCount, 1);
+    assert.equal(ui.outputs[0].gain.value, 0.005);
+});
+
+test('browsers without Web Audio retain fractional native volume', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    await h.api('/api/channels/alice/audio-settings', 'POST', { volume: 0.5 });
+    const ui = frontend(h, 'overlay.js', h.cookie, { audioContext: false });
+    await ui.ready;
+    assert.equal(ui.outputs.length, 0);
+    assert.equal(ui.audios[0].volume, 0.005);
+    assert.equal(ui.plays.length, 1);
+});
+
+test('a suspended audio output asks for a gesture and resumes without changing the track', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const options = { suspended: true, blockResume: true };
+    const ui = frontend(h, 'overlay.js', h.cookie, options);
+    await ui.ready;
+    assert.match(ui.elements.get('playback-message').textContent, /allow audio playback/);
+    const playing = ui.run('currentItemId');
+    options.blockResume = false;
+    ui.windowHandlers.get('pointerdown')();
+    await nextTick();
+    assert.equal(ui.outputs[0].state, 'running');
+    assert.equal(ui.run('currentItemId'), playing);
+    assert.equal(ui.outputs.length, 1);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+});
+
+test('remote Pause is applied during a pending volume save and stale acknowledgements cannot undo it', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const token = (await h.api('/api/streamdeck/alice/connection', 'POST')).data.token;
+    const ui = frontend(h, 'overlay.js', h.cookie);
+    await ui.ready;
+    const original = ui.context.fetch;
+    let release;
+    let held = false;
+    ui.context.fetch = async (url, options = {}) => {
+        const res = await original(url, options);
+        if (options.method === 'POST' && url.endsWith('/audio-settings')) {
+            held = true;
+            await new Promise(resolve => { release = resolve; });
+        }
+        return res;
+    };
+    ui.elements.get('volume-percent').value = '1';
+    await ui.elements.get('volume-percent').fire('change');
+    await until(() => held);
+    const control = body => h.request('/api/streamdeck/control', { method: 'POST', body: {
+        requestId: require('node:crypto').randomUUID(), ...body
+    }, headers: { Authorization: 'Bearer ' + token } });
+    await control({ action: 'adjust-volume', delta: -0.5 });
+    const volumeUpdate = h.events.filter(event => event.event === 'audio:settings').at(-1).payload;
+    ui.emitSocket('audio:settings', volumeUpdate);
+    await control({ action: 'toggle-pause' });
+    const paused = h.events.filter(event => event.event === 'audio:settings').at(-1).payload;
+    ui.emitSocket('audio:settings', paused);
+    assert.equal(ui.audios[0].paused, true, 'Pause is never ignored behind a volume write');
+    release();
+    await ui.run('audioSettingsWrite');
+    assert.equal(ui.audios[0].paused, true);
+    assert.equal(ui.outputs[0].gain.value, 0.005);
+    assert.equal(ui.elements.get('volume-percent').value, 0.5);
+    ui.emitSocket('audio:settings', volumeUpdate);
+    assert.equal(ui.audios[0].paused, true, 'an older socket event cannot undo Pause either');
+});
+
+test('YouTube duration metadata replaces the iframe duration clock', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const ui = frontend(h, 'overlay.js', h.cookie);
+    await ui.ready;
+    await until(() => ui.run('trackDuration') === 180);
+    ui.audios[0].duration = Infinity;
+    ui.audios[0].currentTime = 45;
+    ui.run('updateProgress()');
+    assert.equal(ui.elements.get('seek-bar').value, 25);
+    assert.equal(ui.elements.get('time-display').textContent, '0:45 / 3:00');
+    assert.equal(ui.elements.get('audio-card').hidden, false);
+    assert.equal(ui.elements.get('audio-title').textContent, 'AAAAAAAAAAA');
+});
+
+test('a saved quiet level is applied before connecting the audio graph', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    await h.api('/api/channels/alice/audio-settings', 'POST', { volume: 0.5 });
+    const ui = frontend(h, 'overlay.js', h.cookie);
+    await ui.ready;
+    assert.equal(ui.outputs[0].levelAtConnect, 0.005);
+    assert.equal(ui.outputs[0].gain.value, 0.005);
+});
+
+test('a stale dashboard settings read cannot undo a newer Stream Deck Pause', async t => {
+    const h = await setup(t);
+    const ui = frontend(h, 'main.js', h.cookie);
+    await ui.ready;
+    await ui.run('loadChannelAudioSettings()');
+    const original = ui.context.fetch;
+    let release;
+    let held = false;
+    ui.context.fetch = async (url, options) => {
+        const res = await original(url, options);
+        if (url.endsWith('/audio-settings')) { held = true; await new Promise(resolve => { release = resolve; }); }
+        return res;
+    };
+    const pending = ui.run('loadChannelAudioSettings()');
+    await until(() => held);
+    await h.api('/api/channels/alice/audio-settings', 'POST', { paused: true });
+    ui.emitSocket('audio:settings', h.events.filter(event => event.event === 'audio:settings').at(-1).payload);
+    release();
+    await pending;
+    assert.equal(ui.elements.get('pause-current-btn').textContent, '▶ Resume');
+});
+
+test('duration information from a skipped song cannot change the next track clock', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    await h.add('BBBBBBBBBBB');
+    const ui = frontend(h, 'overlay.js', h.cookie);
+    await ui.ready;
+    const original = ui.context.fetch;
+    let release;
+    let held = false;
+    ui.context.fetch = async (url, options) => {
+        if (url === '/api/yt-audio/AAAAAAAAAAA/info') {
+            held = true;
+            await new Promise(resolve => { release = resolve; });
+            return new Response(JSON.stringify({ duration: 999 }));
+        }
+        return original(url, options);
+    };
+    const pending = ui.run("loadTrackDuration('AAAAAAAAAAA', currentItemId)");
+    await until(() => held);
+    await ui.run('advance()');
+    await until(() => ui.plays.length === 2 && ui.run('trackDuration') === 180);
+    release();
+    await pending;
+    assert.equal(ui.run('trackDuration'), 180);
 });
