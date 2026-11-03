@@ -39,6 +39,7 @@ test('preparation returns 202 promptly; only complete files are published and au
     const args = tools.calls[0].args;
     assert.ok(args.includes('--js-runtimes') && args.includes('node'));
     assert.ok(args.includes('--no-playlist') && args.includes('--retries'));
+    assert.ok(args.includes('--abort-on-unavailable-fragments'));
     assert.equal(args.at(-1), 'https://www.youtube.com/watch?v=AAAAAAAAAAA');
     const ready = await h.request('/api/yt-audio/AAAAAAAAAAA/info');
     assert.deepEqual(ready.data, { status: 'ready', duration: 30 });

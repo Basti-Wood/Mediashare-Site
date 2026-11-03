@@ -195,6 +195,7 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
                     await run(job, 'yt-dlp', [
                         '--ignore-config', '--js-runtimes', 'node', '--no-playlist', '--no-progress',
                         '--socket-timeout', '20', '--retries', '3', '--fragment-retries', '3', '--extractor-retries', '2',
+                        '--abort-on-unavailable-fragments', '--retry-sleep', 'fragment:exp=1:4',
                         '--retry-sleep', 'http:exp=1:4', '--concurrent-fragments', '2', '--match-filters', '!is_live',
                         '--max-filesize', String(maxEntryBytes), '--cache-dir', path.join(root, '.extractor'),
                         '--format', FORMATS[attempt], '--output', path.join(job.stage, 'source.%(ext)s'),
