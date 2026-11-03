@@ -7,13 +7,15 @@ const http     = require('http');
 const path     = require('path');
 const fs       = require('fs');
 const { randomUUID, createHmac } = require('crypto');
-const { execFile, spawn } = require('child_process');
+const { spawn } = require('child_process');
 const multer   = require('multer');
 const WebSocket = require('ws');
 const { Server } = require('socket.io');
 const { createPlaylistImporter } = require('./playlist-imports');
 const { createMusicLibrary } = require('./music-library');
 const { createAudioSettings } = require('./audio-settings');
+const { createYouTubeCache } = require('./youtube-cache');
+const { upcomingMedia } = require('./prefetch-queue');
 const { createStreamDeckTokens, createStreamDeckCommands } = require('./streamdeck');
 const { FileSessionStore, persistentSessionSecret, REMEMBER_LOGIN_MS } = require('./session-store');
 
@@ -687,180 +689,75 @@ async function promoteMyListHeadToBasti(ch) {
     }
 }
 
-// ── YouTube direct-audio resolver (yt-dlp) ────────────────────────────────────
-//
-// Why this exists: the YouTube IFrame player runs in a cross-origin iframe that
-// the browser (Brave/Chrome) suspends when this page is a background tab — that's
-// what kept stopping playback. We can't capture or control the iframe's audio
-// from JS. Instead we resolve a DIRECT audio stream URL with yt-dlp and let the
-// overlay play it through a normal same-origin <audio> element, which the browser
-// does NOT suspend in the background.
-//
-// We used to 302-redirect straight to the resolved googlevideo URL (cheap — no
-// proxying). That broke sound entirely once the overlay started routing the
-// <audio> element through the Web Audio API (for loudness normalisation):
-// browsers silently mute any MediaElementAudioSourceNode whose underlying
-// resource is cross-origin without CORS headers, and googlevideo does not send
-// them. So instead we proxy-transcode the resolved URL through ffmpeg — this
-// also lets us apply EBU R128 loudness normalisation (loudnorm) so every track
-// plays back at the same perceived volume, same-origin, no CORS issues.
-//
-// The resolved googlevideo URL is signed and time-limited (a few hours), so we
-// cache it briefly to avoid spawning yt-dlp on every play.
-
-const ytAudioCache = new Map(); // videoId -> { source: { url, headers }, expires }
-const ytAudioPending = new Map();
-const YT_AUDIO_TTL_MS = 90 * 60 * 1000; // 90 min — comfortably inside the signed-URL lifetime
-
-// Target loudness for all normalised playback (YouTube proxy + local uploads).
-// -14 LUFS matches the common streaming-platform target (Spotify/YouTube/Apple
-// Music), so songs from different sources end up at a consistent volume.
+// Download and validate complete audio before playback; upcoming tracks share
+// this bounded disk cache. No signed YouTube URL is passed to the browser.
 const LOUDNORM_FILTER = 'loudnorm=I=-14:TP=-1.5:LRA=11';
-
-function resolveYouTubeAudioSource(videoId) {
-    if (ytAudioPending.has(videoId)) return ytAudioPending.get(videoId);
-    const pending = new Promise((resolve, reject) => {
-        // Modern YouTube extraction needs an enabled JS runtime. Keep yt-dlp's
-        // HTTP headers with the signed URL so ffmpeg uses the same request context.
-        execFile(
-            'yt-dlp',
-            [
-                '--ignore-config',
-                '--js-runtimes', 'node',
-                '-f', 'bestaudio/best',
-                '--dump-single-json',
-                '--skip-download',
-                '--no-playlist',
-                '--no-warnings',
-                '--',
-                `https://www.youtube.com/watch?v=${videoId}`
-            ],
-            { timeout: 45000, maxBuffer: 4 * 1024 * 1024 },
-            (err, stdout, stderr) => {
-                if (err) {
-                    return reject(Object.assign(new Error(String(stderr || err.message).trim()), { code: err.code }));
-                }
-                try {
-                    const data = JSON.parse(String(stdout));
-                    const selected = data.requested_downloads?.[0] || data;
-                    const url = selected.url || data.url;
-                    if (!url || !['https:', 'http:'].includes(new URL(url).protocol))
-                        throw new Error('yt-dlp returned no usable audio URL.');
-                    const headers = {};
-                    for (const [name, value] of Object.entries(selected.http_headers || data.http_headers || {})) {
-                        if (/^(user-agent|referer|origin|accept)$/i.test(name)
-                            && typeof value === 'string' && !/[\r\n]/.test(value)) headers[name] = value;
-                    }
-                    resolve({ url, headers, duration: Number.isFinite(data.duration) && data.duration > 0 ? data.duration : null });
-                } catch (err) {
-                    reject(new Error(`Could not read yt-dlp audio metadata: ${err.message}`));
-                }
-            }
-        );
-    });
-    ytAudioPending.set(videoId, pending);
-    pending.finally(() => ytAudioPending.delete(videoId)).catch(() => {});
-    return pending;
+function cacheSetting(name, fallback, min, max) {
+    const value = Number(process.env[name]);
+    return Number.isFinite(value) && process.env[name] !== undefined
+        ? Math.max(min, Math.min(max, value)) : fallback;
 }
-
-async function cachedYouTubeSource(videoId) {
-    const cached = ytAudioCache.get(videoId);
-    if (cached && cached.expires > Date.now()) return cached.source;
-    const source = await resolveYouTubeAudioSource(videoId);
-    ytAudioCache.set(videoId, { source, expires: Date.now() + YT_AUDIO_TTL_MS });
-    return source;
-}
+const YOUTUBE_PREFETCH_COUNT = Math.floor(cacheSetting('YOUTUBE_PREFETCH_COUNT', 3, 0, 10));
+const youtubeCacheMB = cacheSetting('YOUTUBE_CACHE_MAX_MB', 1024, 16, 10240);
+const youtubeCache = createYouTubeCache({
+    root: process.env.YOUTUBE_CACHE_ROOT || path.join(__dirname, '../..', 'data', 'youtube-cache'),
+    maxBytes: youtubeCacheMB * 1024 * 1024,
+    maxEntryBytes: Math.min(youtubeCacheMB, cacheSetting('YOUTUBE_CACHE_ENTRY_MB', 128, 1, 1024)) * 1024 * 1024,
+    ttlMs: cacheSetting('YOUTUBE_CACHE_TTL_HOURS', 6, 0.1, 168) * 60 * 60 * 1000,
+    downloadTimeoutMs: cacheSetting('YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS', 180, 10, 900) * 1000,
+    loudnorm: LOUDNORM_FILTER,
+    onError: (id, err) => console.error(`YouTube preparation ${id}: ${err.code}: ${err.message}`)
+});
 function validYouTubeAudioId(req, res) {
     if (/^[A-Za-z0-9_-]{11}$/.test(req.params.videoId || '')) return true;
     res.status(400).json({ error: 'Invalid video id.' });
     return false;
 }
-function youtubeResolutionError(res, err) {
-    res.status(502).json({ error: err.code === 'ENOENT' ? 'yt-dlp is not installed on the server.' : 'Could not resolve YouTube audio.',
-        code: err.code === 'ENOENT' ? 'YTDLP_MISSING' : 'YOUTUBE_RESOLVE_FAILED' });
+function youtubePreparationError(res, err) {
+    if (res.destroyed || res.headersSent) return;
+    res.status(err.status || 502).json({ status: 'failed', error: err.status ? err.message : 'Could not prepare YouTube audio.',
+        code: err.code || 'PREPARATION_FAILED' });
 }
 
-// The audio-only player gets duration from this same cached resolver, without
-// loading a YouTube iframe or exposing signed stream URLs/headers to clients.
-app.get('/api/yt-audio/:videoId/info', async (req, res) => {
-    if (!validYouTubeAudioId(req, res)) return;
-    try {
-        const source = await cachedYouTubeSource(req.params.videoId);
-        res.json({ duration: source.duration });
-    } catch (err) { youtubeResolutionError(res, err); }
-});
-
-// Same-origin, normalized native audio for dashboard, pop-out and OBS.
-app.get('/api/yt-audio/:videoId', async (req, res) => {
-    if (!validYouTubeAudioId(req, res)) return;
-    try {
-        const source = await cachedYouTubeSource(req.params.videoId);
-        if (!res.destroyed) streamNormalizedAudio(source, res, req.params.videoId, () => ytAudioCache.delete(req.params.videoId));
-    } catch (err) { youtubeResolutionError(res, err); }
-});
-
-// Transcodes a (possibly remote) audio source through ffmpeg with loudness
-// normalisation and streams the result to the client same-origin. `res` must
-// not have been responded to yet.
-function streamNormalizedAudio(source, res, label, onFailure = () => {}) {
-    const headers = Object.entries(source.headers || {}).map(([name, value]) => `${name}: ${value}\r\n`).join('');
-    const ff = spawn('ffmpeg', [
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',
-        ...(headers ? ['-headers', headers] : []),
-        '-i', source.url,
-        '-vn',
-        '-af', LOUDNORM_FILTER,
-        '-f', 'mp3',
-        '-b:a', '192k',
-        'pipe:1'
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-
-    let sentData = false;
-    let stderrTail = '';
-    ff.stderr.on('data', chunk => {
-        stderrTail = (stderrTail + chunk.toString()).slice(-2000);
-    });
-
+// Preparation is asynchronous so reverse proxies and browser media timeouts do
+// not abort a long first download. The overlay polls until the file is ready.
+app.get('/api/yt-audio/:videoId/info', (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
+    if (!validYouTubeAudioId(req, res)) return;
+    try {
+        const state = youtubeCache.request(req.params.videoId, { retry: req.query.retry === '1' });
+        if (state.status === 'preparing') {
+            res.setHeader('Retry-After', '1');
+            return res.status(202).json(state);
+        }
+        const { httpStatus, ...body } = state;
+        res.status(httpStatus || 200).json(body);
+    } catch (err) { youtubePreparationError(res, err); }
+});
 
-    ff.stdout.once('data', () => {
-        sentData = true;
-        res.setHeader('Content-Type', 'audio/mpeg');
-    });
-    // A failed/empty ffmpeg stdout must not end the response with a fake 200
-    // before its close event can send a useful JSON 502.
-    ff.stdout.pipe(res, { end: false });
-
-    ff.on('error', err => {
-        console.error(`ffmpeg failed to start for ${label}:`, err.message || err);
-        onFailure();
-        if (!res.headersSent) res.status(502).json({ error: 'Audio transcode failed.', code: 'AUDIO_TRANSCODE_FAILED' });
-        else if (!res.writableEnded) res.destroy();
-    });
-
-    ff.on('close', code => {
+// Only completed, checked, same-origin MP3s are served. sendFile supplies byte
+// ranges and Content-Length for seeking and reliable completion detection.
+app.get('/api/yt-audio/:videoId', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!validYouTubeAudioId(req, res)) return;
+    let lease;
+    try {
+        lease = youtubeCache.acquire(req.params.videoId);
+        res.once('finish', lease.release);
+        res.once('close', lease.release);
+        const entry = await lease.ready;
         if (res.destroyed) return;
-        if (code !== 0 && sentData) {
-            onFailure();
-            // Truncating a stream is a network failure, not a completed song.
-            res.destroy();
-            return;
-        }
-        if (!sentData) {
-            console.error(`ffmpeg exited ${code} for ${label}:`, stderrTail.trim());
-            onFailure();
-            if (!res.headersSent) res.status(502).json({ error: 'No playable audio was produced.', code: 'AUDIO_TRANSCODE_FAILED' });
-        }
-        if (!res.writableEnded) res.end();
-    });
-
-    // Client changed/skipped tracks — stop transcoding immediately.
-    res.on('close', () => {
-        if (!ff.killed) ff.kill('SIGKILL');
-    });
-}
+        res.type('audio/mpeg');
+        res.sendFile(entry.file, { dotfiles: 'allow' }, err => {
+            if (!err) return;
+            if (res.headersSent) res.destroy(err);
+            else youtubePreparationError(res, err);
+        });
+    } catch (err) {
+        lease?.release();
+        youtubePreparationError(res, err);
+    }
+});
 
 // ── Overlay endpoints (no auth — used by OBS browser source) ─────────────────
 
@@ -937,6 +834,12 @@ app.get('/api/channels/:ch/current', async (req, res) => {
                 : null;
             const playbackId = playbackIdFor(ch, current);
             if (current) current._playbackId = playbackId;
+            // Read-only simulation: warming files must never promote, rotate or
+            // consume queue entries. Local uploads already have their own files.
+            const upcoming = upcomingMedia({ queue: media, personal: getMyList(ch), mode: modeData,
+                isOwner: item => isOwnerSong(item, ch), count: YOUTUBE_PREFETCH_COUNT });
+            youtubeCache.plan(ch, parseYouTubeVideoId(current?.url || current?.media || ''),
+                upcoming.map(item => parseYouTubeVideoId(item.url || item.media || '')).filter(Boolean));
             res.json({ current });
         } catch (e) {
             console.error('current failed:', e.message || e);

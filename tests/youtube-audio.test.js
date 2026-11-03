@@ -2,155 +2,120 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { EventEmitter } = require('node:events');
-const { PassThrough } = require('node:stream');
+const fs = require('node:fs');
+const path = require('node:path');
+const { setImmediate: nextTick } = require('node:timers/promises');
 const { createTestServer } = require('./helpers/server');
+const { createMediaTools } = require('./helpers/media-tools');
 
-function audioTools(options = {}) {
-    const resolutions = [];
-    const transcodes = [];
-    let failTranscode = options.failTranscode;
-    return {
-        resolutions, transcodes,
-        execFile(command, args, settings, callback) {
-            resolutions.push({ command, args, settings });
-            setImmediate(() => {
-                if (options.missing) return callback(Object.assign(new Error('yt-dlp not installed'), { code: 'ENOENT' }));
-                const data = options.metadata || { url: 'https://cdn.example.test/audio', http_headers: {
-                    'User-Agent': 'yt-dlp-agent', Referer: 'https://www.youtube.com/',
-                    Origin: 'https://www.youtube.com', Accept: '*/*', 'Not-Forwarded': 'secret',
-                    'Bad-Header': 'value\r\nInjected: value'
-                } };
-                callback(null, JSON.stringify(data), '');
-            });
-        },
-        spawn(command, args, settings) {
-            const child = new EventEmitter();
-            child.stdout = new PassThrough();
-            child.stderr = new PassThrough();
-            child.killed = false;
-            let closed = false;
-            const close = code => {
-                if (closed) return;
-                closed = true;
-                child.exitCode = code;
-                child.emit('close', code);
-            };
-            child.kill = () => { child.killed = true; close(null); return true; };
-            transcodes.push({ command, args, settings });
-            setImmediate(() => {
-                if (options.missingFfmpeg) {
-                    child.emit('error', Object.assign(new Error('ffmpeg missing'), { code: 'ENOENT' }));
-                    child.stdout.end();
-                    return setImmediate(() => close(-2));
-                }
-                if (options.emptySuccess) {
-                    child.stdout.end();
-                    return setImmediate(() => close(0));
-                }
-                if (options.partialFailure) {
-                    child.stdout.end(Buffer.from('ID3 truncated audio'));
-                    return setImmediate(() => close(1));
-                }
-                if (failTranscode) {
-                    failTranscode = false;
-                    child.stderr.end('Upstream HTTP 403');
-                    child.stdout.end();
-                    // stdout ends before the process closes, as with real ffmpeg.
-                    setImmediate(() => close(1));
-                } else {
-                    child.stdout.end(Buffer.from('ID3 test audio'));
-                    child.stderr.end();
-                    setImmediate(() => close(0));
-                }
-            });
-            return child;
-        }
-    };
+async function until(predicate) {
+    for (let i = 0; i < 2000; i++) { if (predicate()) return; await nextTick(); }
+    throw new Error('Preparation did not reach expected state');
 }
-
-async function setup(t, options) {
-    const tools = audioTools(options);
-    const h = await createTestServer(tools);
+async function setup(t, options = {}) {
+    const tools = createMediaTools(options);
+    const h = await createTestServer({ cacheSpawn: tools.spawn });
     t.after(() => h.close());
-    h.audio = () => fetch(h.base + '/api/yt-audio/AAAAAAAAAAA');
-    return { h, tools };
+    const audio = (id = 'AAAAAAAAAAA', options) => fetch(h.base + '/api/yt-audio/' + id, options);
+    return { h, tools, audio };
 }
 
-test('audio resolution enables Node, preserves upstream headers and caches successful sources', async t => {
-    const { h, tools } = await setup(t);
-    const responses = await Promise.all([h.audio(), h.audio()]);
-    for (const response of responses) {
+test('preparation returns 202 promptly; only complete files are published and audio clients share one download', async t => {
+    const { h, tools, audio } = await setup(t, { blockDownloads: true });
+    const info = await h.request('/api/yt-audio/AAAAAAAAAAA/info');
+    assert.equal(info.status, 202);
+    assert.equal(info.data.status, 'preparing');
+    const [first, second] = [audio(), audio()];
+    await until(() => tools.pending.length === 1);
+    assert.equal(fs.existsSync(path.join(h.localRoot, '.youtube-cache', 'AAAAAAAAAAA.mp3')), false);
+    tools.release();
+    for (const response of await Promise.all([first, second])) {
         assert.equal(response.status, 200);
         assert.equal(response.headers.get('content-type'), 'audio/mpeg');
-        assert.equal(await response.text(), 'ID3 test audio');
+        assert.equal(Number(response.headers.get('content-length')), Buffer.byteLength('ID3 complete test audio'));
+        assert.equal(await response.text(), 'ID3 complete test audio');
     }
-    assert.equal(tools.resolutions.length, 1);
-    const resolution = tools.resolutions[0];
-    assert.ok(resolution.args.includes('--js-runtimes'));
-    assert.ok(resolution.args.includes('node'));
-    assert.ok(resolution.args.includes('bestaudio/best'));
-    const args = tools.transcodes[0].args;
-    const headers = args[args.indexOf('-headers') + 1];
-    assert.match(headers, /User-Agent: yt-dlp-agent\r\n/);
-    assert.match(headers, /Referer: https:\/\/www.youtube.com\/\r\n/);
-    assert.equal(headers.includes('Not-Forwarded'), false);
-    assert.equal(headers.includes('Injected'), false);
-    await (await h.audio()).text();
-    assert.equal(tools.resolutions.length, 1);
+    assert.equal(tools.calls.filter(call => call.command === 'yt-dlp').length, 1);
+    const args = tools.calls[0].args;
+    assert.ok(args.includes('--js-runtimes') && args.includes('node'));
+    assert.ok(args.includes('--no-playlist') && args.includes('--retries'));
+    assert.equal(args.at(-1), 'https://www.youtube.com/watch?v=AAAAAAAAAAA');
+    const ready = await h.request('/api/yt-audio/AAAAAAAAAAA/info');
+    assert.deepEqual(ready.data, { status: 'ready', duration: 30 });
+    const range = await audio('AAAAAAAAAAA', { headers: { Range: 'bytes=4-11' } });
+    assert.equal(range.status, 206);
+    assert.equal(await range.text(), 'complete');
+    const head = await audio('AAAAAAAAAAA', { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal(await head.text(), '');
+    assert.equal(tools.calls.filter(call => call.command === 'yt-dlp').length, 1);
 });
 
-test('empty failed transcodes return JSON 502 and invalidate the cached URL for retry', async t => {
-    const { h, tools } = await setup(t, { failTranscode: true });
-    const failed = await h.audio();
-    assert.equal(failed.status, 502);
-    assert.match(failed.headers.get('content-type'), /application\/json/);
-    assert.equal((await failed.json()).code, 'AUDIO_TRANSCODE_FAILED');
-    const retry = await h.audio();
-    assert.equal(retry.status, 200);
-    assert.equal(await retry.text(), 'ID3 test audio');
-    assert.equal(tools.resolutions.length, 2);
+test('a refused audio-only download falls back to combined MP4 and extracts its audio', async t => {
+    const { tools, audio } = await setup(t, { downloadFailure: call => call.args.includes('bestaudio[ext=m4a]/bestaudio/best') ? 'HTTP Error 403' : null });
+    const response = await audio();
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'ID3 complete test audio');
+    const downloads = tools.calls.filter(call => call.command === 'yt-dlp');
+    assert.equal(downloads.length, 2);
+    assert.match(downloads[1].args[downloads[1].args.indexOf('--format') + 1], /best\[ext=mp4\]/);
+    const conversion = tools.calls.find(call => call.command === 'ffmpeg' && call.args.at(-1).endsWith('ready.mp3'));
+    assert.ok(conversion.args.includes('-vn'));
+    assert.ok(conversion.args.includes('loudnorm=I=-14:TP=-1.5:LRA=11'));
+    assert.ok(conversion.args[conversion.args.indexOf('-i') + 1].endsWith('source.mp4'));
 });
 
-test('missing yt-dlp and unusable metadata are reported as resolver failures', async t => {
-    for (const options of [{ missing: true }, { metadata: { url: 'file:///etc/passwd' } }, { metadata: {} }]) {
-        const { h, tools } = await setup(t, options);
-        const response = await h.audio();
-        assert.equal(response.status, 502);
-        const data = await response.json();
-        assert.equal(data.code, options.missing ? 'YTDLP_MISSING' : 'YOUTUBE_RESOLVE_FAILED');
-        assert.equal(tools.transcodes.length, 0);
-    }
-});
-
-test('missing ffmpeg and empty successful processes return 502 instead of empty audio', async t => {
-    for (const options of [{ missingFfmpeg: true }, { emptySuccess: true }]) {
-        const { h } = await setup(t, options);
-        const response = await h.audio();
+test('missing media tools and empty, invalid, truncated or undecodable files return safe errors without publishing audio', async t => {
+    for (const options of [{ missing: 'yt-dlp' }, { missing: 'ffmpeg' }, { missing: 'ffprobe' },
+        { emptyOutput: true }, { noAudio: true }, { truncated: true }, { decodeFailure: true }]) {
+        const { h, audio } = await setup(t, options);
+        const response = await audio();
         assert.equal(response.status, 502);
         assert.match(response.headers.get('content-type'), /application\/json/);
-        assert.equal((await response.json()).code, 'AUDIO_TRANSCODE_FAILED');
+        const data = await response.json();
+        assert.equal(data.status, 'failed');
+        assert.equal(data.code, options.missing ? 'DEPENDENCY_MISSING' : 'INVALID_MEDIA');
+        assert.equal(fs.existsSync(path.join(h.localRoot, '.youtube-cache', 'AAAAAAAAAAA.mp3')), false);
+        assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
     }
 });
 
-test('a failed partial transcode breaks the stream instead of reporting normal completion', async t => {
-    const { h } = await setup(t, { partialFailure: true });
-    await assert.rejects(async () => {
-        const response = await h.audio();
-        await response.arrayBuffer();
-    });
+test('unavailable songs do not loop downloads; explicit Retry starts a fresh attempt and keeps the queue intact', async t => {
+    let unavailable = true;
+    const { h, tools, audio } = await setup(t, { downloadFailure: () => unavailable ? 'Video unavailable. This video is private' : null });
+    h.queues.set('alice', [{ id: 'a', media: 'https://youtu.be/AAAAAAAAAAA', username: 'viewer' }]);
+    const failed = await audio();
+    assert.equal((await failed.json()).code, 'YOUTUBE_UNAVAILABLE');
+    assert.equal((await h.request('/api/yt-audio/AAAAAAAAAAA/info')).status, 502);
+    assert.equal(tools.calls.filter(call => call.command === 'yt-dlp').length, 1);
+    unavailable = false;
+    assert.equal((await h.request('/api/yt-audio/AAAAAAAAAAA/info?retry=1')).status, 202);
+    const retry = await audio();
+    assert.equal(retry.status, 200);
+    await retry.text();
+    assert.equal(tools.calls.filter(call => call.command === 'yt-dlp').length, 2);
+    assert.equal(h.queues.get('alice').length, 1);
 });
 
-test('duration info and audio share extraction without exposing the signed URL or creating another player', async t => {
-    const { h, tools } = await setup(t, { metadata: { url: 'https://cdn.example.test/private-audio', duration: 123.5, http_headers: { 'User-Agent': 'private-agent' } } });
-    const [info, audio] = await Promise.all([fetch(h.base + '/api/yt-audio/AAAAAAAAAAA/info'), h.audio()]);
-    assert.equal(info.status, 200);
-    assert.deepEqual(await info.json(), { duration: 123.5 });
-    assert.equal(await audio.text(), 'ID3 test audio');
-    assert.equal(tools.resolutions.length, 1);
-    assert.equal(tools.transcodes.length, 1);
-    const again = await fetch(h.base + '/api/yt-audio/AAAAAAAAAAA/info');
-    assert.deepEqual(await again.json(), { duration: 123.5 });
-    assert.equal(tools.resolutions.length, 1);
-    assert.equal((await fetch(h.base + '/api/yt-audio/bad/info')).status, 400);
+test('current prepares the next three songs without consuming, rotating or editing the upstream queue', async t => {
+    const { h, tools } = await setup(t);
+    const queue = 'ABCDE'.split('').map(id => ({ id, media: 'https://youtu.be/' + id.repeat(11), username: 'viewer' }));
+    h.queues.set('alice', queue);
+    const before = JSON.stringify(queue);
+    const current = await h.request('/api/channels/alice/current');
+    assert.equal(current.status, 200);
+    await until(() => 'ABCD'.split('').every(id => h.youtubeCache.status(id.repeat(11)).status === 'ready'));
+    const urls = tools.calls.filter(call => call.command === 'yt-dlp').map(call => call.args.at(-1));
+    assert.deepEqual(urls, 'ABCD'.split('').map(id => 'https://www.youtube.com/watch?v=' + id.repeat(11)));
+    assert.equal(JSON.stringify(queue), before);
+    assert.deepEqual(h.calls.map(call => call.action), ['getallmedia']);
+    await h.request('/api/channels/alice/current');
+    assert.equal(tools.calls.filter(call => call.command === 'yt-dlp').length, 4);
+});
+
+test('invalid IDs never start tools or access arbitrary cache paths', async t => {
+    const { h, tools, audio } = await setup(t);
+    assert.equal((await audio('bad')).status, 400);
+    assert.equal((await h.request('/api/yt-audio/bad/info')).status, 400);
+    assert.equal(tools.calls.length, 0);
 });

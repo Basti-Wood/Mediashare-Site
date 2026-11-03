@@ -13,3 +13,5 @@ data/sessions/
 tests/.tmp-*/
 
 data/streamdeck/
+
+data/youtube-cache/

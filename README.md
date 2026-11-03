@@ -95,10 +95,10 @@ metadata change so `/getallmedia` and the Twitch bot also receive those names.
 Older API versions ignore these query parameters; the dashboard still shows the
 known filename for the current song.
 
-Metadata lookup and live YouTube audio playback use `yt-dlp`; `ffmpeg` normalizes
-uploaded MP3s and the live audio stream. The existing Docker image includes both
-and Node 24. Refresh the dashboard and OBS browser source after updating; both
-scripts are versioned `audio-output-2`.
+Metadata lookup and temporary YouTube downloads use `yt-dlp`; `ffmpeg` normalizes
+uploaded MP3s and prepared audio. `ffprobe` checks the downloaded and normalized
+files. The Docker image includes these tools and Node 24. Refresh the dashboard and OBS browser source after updating; both
+scripts are versioned `audio-cache-1`.
 
 ## If songs immediately skip or audio returns 502
 
@@ -107,6 +107,42 @@ and **Skip this song**. Only a completed song or an explicit Skip advances the
 queue. YouTube playback is audio-only through the same native audio output as
 uploaded MP3s; no YouTube video widget, iframe API or iframe fallback is loaded.
 Autoplay permission failures ask for a click.
+
+## Temporary YouTube audio and preloading
+
+The player downloads each YouTube song to the server before playing it. It tries
+an audio-only source first; if that fails, it tries a combined MP4/video source
+and extracts its audio. Downloads get bounded retries. The server checks the
+complete file, normalizes it to MP3 and verifies its duration and decoding before
+making it playable. The dashboard shows **Downloading** or **Preparing**, with a
+Skip button. No video widget is displayed and no MP4 is downloaded to your PC.
+
+While the current song plays, the server prepares the next **three tracks** in
+queue order, including My List, alternating mode, loop and Play next uploads.
+This does not advance the queue. Local MP3s already have files and need no extra
+download. Dashboard and OBS share completed files and download jobs, so a song
+is downloaded once, rather than streamed separately for each player. Preparing
+new current songs takes priority over background downloads.
+
+Temporary MP3s live in `./data/youtube-cache`, separate from uploaded files and
+saved playlists. By default completed files use at most **1 GB**, each source
+and prepared file is limited to **128 MB**, and idle files expire after **six
+hours**. Old files are evicted first; files currently being served or played are
+protected. Two jobs may run concurrently, each also using bounded temporary
+working space. Unneeded pending downloads are cancelled when a channel's plan
+changes or its players disconnect/stop polling. Completed cache files survive
+container restarts. Uploaded files and playlist snapshots are never deleted by
+cache cleanup.
+
+Configure `YOUTUBE_CACHE_MAX_MB`, `YOUTUBE_CACHE_ENTRY_MB`,
+`YOUTUBE_CACHE_TTL_HOURS`, `YOUTUBE_PREFETCH_COUNT` (0–10; 0 disables lookahead)
+and `YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS` in the container environment. A first
+song can take time to download and normalize; later cached songs start promptly.
+Private, removed, age/region restricted, live or oversized videos, and videos
+YouTube refuses to serve to your server cannot be guaranteed playable. Failures
+show an actionable error and keep the song queued. **Play / Retry** starts a new
+attempt; other clients reuse failures for one minute to avoid retry storms.
+Rebuild Docker with `--no-cache` to refresh yt-dlp when YouTube changes.
 
 ## Saved volume and shared Pause/Resume
 
@@ -133,7 +169,7 @@ live in `./data/audio-settings` under the same persistent data mount as MP3s.
 If the Local Music playlist form is missing, verify that the feature pull request
 has been merged and that your deployment has pulled that revision. Refresh the
 dashboard and OBS browser source after updating. The updated overlay script is
-versioned `audio-output-2`.
+versioned `audio-cache-1`.
 
 ## Update an existing Docker installation
 

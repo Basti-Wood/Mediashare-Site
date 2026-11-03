@@ -21,6 +21,8 @@ function frontend(h, file, cookie, options = {}) {
     const windowHandlers = new Map();
     const documentHandlers = new Map();
     const socketHandlers = new Map();
+    const timers = new Map();
+    let timerSerial = 0;
     function element(id) {
         if (!elements.has(id)) elements.set(id, {
             id, value: '', textContent: '', innerHTML: '', checked: false,
@@ -54,10 +56,11 @@ function frontend(h, file, cookie, options = {}) {
             } }) },
         navigator: {}, URLSearchParams, FormData, Blob,
         console: { log() {}, warn() {}, error: (...args) => errors.push(args) },
-        setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 1; }, clearInterval() {},
+        setTimeout(callback, delay) { const id = ++timerSerial; timers.set(id, { callback, delay }); return id; },
+        clearTimeout(id) { timers.delete(id); }, setInterval() { return 1; }, clearInterval() {},
         io: () => ({ on(event, handler) { socketHandlers.set(event, handler); }, emit() {} }),
-        fetch: (url, request = {}) => /\/api\/yt-audio\/[A-Za-z0-9_-]{11}\/info$/.test(url)
-            ? Promise.resolve(new Response(JSON.stringify({ duration: 180 }), { headers: { 'Content-Type': 'application/json' } }))
+        fetch: (url, request = {}) => /\/api\/yt-audio\/[A-Za-z0-9_-]{11}\/info(?:\?|$)/.test(url)
+            ? (options.info ? options.info(url) : Promise.resolve(new Response(JSON.stringify({ status: 'ready', duration: 180 }), { headers: { 'Content-Type': 'application/json' } })))
             : fetch(h.base + url, { ...request, headers: { ...request.headers, ...(cookie ? { Cookie: cookie } : {}) } }),
         Audio: class {
             constructor() { this.src = ''; this.paused = true; this.currentTime = 0; this.duration = NaN; this.handlers = new Map(); audios.push(this); }
@@ -71,6 +74,11 @@ function frontend(h, file, cookie, options = {}) {
     const source = fs.readFileSync(path.resolve(__dirname, '../scrs/frontend', file), 'utf8');
     const ready = vm.runInContext(source, context, { filename: file });
     return { context, elements, errors, audios, plays, outputs, windowHandlers, documentHandlers, ready,
+        runTimer(delay) {
+            const next = [...timers].find(([, timer]) => timer.delay === delay);
+            if (!next) throw new Error('No timer for ' + delay);
+            timers.delete(next[0]); return next[1].callback();
+        },
         emitSocket: (event, payload) => socketHandlers.get(event)?.(payload),
         run: code => vm.runInContext(code, context) };
 }
@@ -651,7 +659,7 @@ test('a stale dashboard settings read cannot undo a newer Stream Deck Pause', as
     assert.equal(ui.elements.get('pause-current-btn').textContent, '▶ Resume');
 });
 
-test('duration information from a skipped song cannot change the next track clock', async t => {
+test('late preparation from a skipped song cannot play over the next track or change its clock', async t => {
     const h = await setup(t);
     await h.add('AAAAAAAAAAA');
     await h.add('BBBBBBBBBBB');
@@ -668,11 +676,78 @@ test('duration information from a skipped song cannot change the next track cloc
         }
         return original(url, options);
     };
-    const pending = ui.run("loadTrackDuration('AAAAAAAAAAA', currentItemId)");
+    const pending = ui.run("prepareYouTubeAudio('AAAAAAAAAAA', currentItemId)");
     await until(() => held);
     await ui.run('advance()');
     await until(() => ui.plays.length === 2 && ui.run('trackDuration') === 180);
     release();
     await pending;
     assert.equal(ui.run('trackDuration'), 180);
+    assert.equal(ui.plays.length, 2);
+});
+
+test('the player waits for preparation and preserves saved pause and volume while downloading', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    await h.api('/api/channels/alice/audio-settings', 'POST', { volume: 0.5, paused: true });
+    let checks = 0;
+    const ui = frontend(h, 'overlay.js', h.cookie, { info: async () => {
+        checks++;
+        return new Response(JSON.stringify(checks < 3 ? { status: 'preparing', stage: checks === 1 ? 'downloading' : 'checking', retryAfterMs: 1000 }
+            : { status: 'ready', duration: 250 }), { status: checks < 3 ? 202 : 200 });
+    } });
+    await ui.ready;
+    assert.equal(ui.audios[0].src, '');
+    assert.equal(ui.plays.length, 0);
+    assert.match(ui.elements.get('playback-message').textContent, /Downloading/);
+    assert.equal(ui.elements.get('playback-retry-btn').hidden, true);
+    assert.equal(ui.elements.get('playback-status').hidden, false);
+    await ui.runTimer(1000);
+    assert.match(ui.elements.get('playback-message').textContent, /checking/);
+    assert.equal(ui.plays.length, 0);
+    await ui.runTimer(1000);
+    assert.equal(ui.audios[0].src, '/api/yt-audio/AAAAAAAAAAA');
+    assert.equal(ui.run('trackDuration'), 250);
+    assert.equal(ui.run('preparingYouTube'), false);
+    assert.equal(ui.plays.length, 0);
+    await ui.elements.get('pause-resume-btn').fire('click');
+    assert.equal(ui.plays.length, 1);
+    assert.equal(ui.outputs[0].gain.value, 0.005);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+});
+
+test('preparation errors show the server reason, keep the song queued and allow explicit Retry', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    const checks = [];
+    const ui = frontend(h, 'overlay.js', h.cookie, { info: async url => {
+        checks.push(url);
+        return new Response(JSON.stringify(url.includes('?retry=1') ? { status: 'ready', duration: 180 }
+            : { status: 'failed', error: 'YouTube is rate-limiting this server. Wait a little and retry.' }), { status: url.includes('?retry=1') ? 200 : 502 });
+    } });
+    await ui.ready;
+    const current = ui.run('currentItemId');
+    assert.equal(ui.plays.length, 0);
+    assert.match(ui.elements.get('playback-message').textContent, /rate-limiting/);
+    assert.equal(ui.elements.get('playback-retry-btn').hidden, false);
+    await ui.elements.get('playback-retry-btn').fire('click');
+    assert.deepEqual(checks, ['/api/yt-audio/AAAAAAAAAAA/info', '/api/yt-audio/AAAAAAAAAAA/info?retry=1']);
+    assert.equal(ui.run('currentItemId'), current);
+    assert.equal(ui.plays.length, 1);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+});
+
+test('Skip cancels pending preparation polls and starts the next prepared song once', async t => {
+    const h = await setup(t);
+    await h.add('AAAAAAAAAAA');
+    await h.add('BBBBBBBBBBB');
+    const ui = frontend(h, 'overlay.js', h.cookie, { info: async url => new Response(JSON.stringify(url.includes('AAAAAAAAAAA')
+        ? { status: 'preparing', stage: 'downloading' } : { status: 'ready', duration: 180 }), { status: url.includes('AAAAAAAAAAA') ? 202 : 200 }) });
+    await ui.ready;
+    assert.equal(ui.plays.length, 0);
+    await ui.elements.get('playback-skip-btn').fire('click');
+    await until(() => ui.plays.length === 1);
+    assert.equal(ui.plays[0], '/api/yt-audio/BBBBBBBBBBB');
+    assert.throws(() => ui.runTimer(1000), /No timer/);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
 });
