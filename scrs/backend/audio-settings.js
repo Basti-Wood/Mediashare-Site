@@ -17,13 +17,16 @@ function createAudioSettings(root) {
             cache.set(key, {
                 volume: typeof saved?.volume === 'number' && Number.isFinite(saved.volume)
                     ? Math.max(0, Math.min(100, saved.volume)) : 100,
-                paused: saved?.paused === true
+                paused: saved?.paused === true,
+                revision: Number.isSafeInteger(saved?.revision) && saved.revision >= 0 ? saved.revision : 0
             });
         }
-        return { ...cache.get(key) };
+        const { volume, paused } = cache.get(key);
+        return { volume, paused };
     }
     return {
         get,
+        revision(channel) { get(channel); return cache.get(keyFor(channel)).revision; },
         update(channel, changes = {}) {
             if (!changes || typeof changes !== 'object' || Array.isArray(changes))
                 throw Object.assign(new Error('Audio settings must be an object.'), { status: 400 });
@@ -37,9 +40,10 @@ function createAudioSettings(root) {
                 ...(paused === undefined ? {} : { paused }) };
             fs.mkdirSync(root, { recursive: true });
             const file = fileFor(key);
-            fs.writeFileSync(file + '.tmp', JSON.stringify(settings) + '\n');
+            const saved = { ...settings, revision: cache.get(key).revision + 1 };
+            fs.writeFileSync(file + '.tmp', JSON.stringify(saved) + '\n');
             fs.renameSync(file + '.tmp', file);
-            cache.set(key, settings);
+            cache.set(key, saved);
             return { ...settings };
         }
     };

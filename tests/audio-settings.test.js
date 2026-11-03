@@ -44,3 +44,18 @@ test('invalid audio settings are rejected without changing saved preferences', a
     const store = createAudioSettings(path.join(h.localRoot, '.audio-settings'));
     for (const value of [null, [], 0, 'invalid']) assert.throws(() => store.update('alice', value), { status: 400 });
 });
+
+test('shared setting revisions increase and survive restart without changing the settings shape', async t => {
+    const h = await setup(t);
+    const initial = (await h.api('alice')).data;
+    assert.equal(initial.revision, 0);
+    const first = (await h.api('alice', 'POST', { volume: 0.5 })).data;
+    const second = (await h.api('alice', 'POST', { paused: true })).data;
+    assert.equal(first.revision, 1);
+    assert.equal(second.revision, 2);
+    assert.deepEqual(second.settings, { volume: 0.5, paused: true });
+    const restored = createAudioSettings(path.join(h.localRoot, '.audio-settings'));
+    assert.equal(restored.revision('alice'), 2);
+    assert.deepEqual(restored.get('alice'), second.settings);
+    assert.equal(h.events.filter(event => event.event === 'audio:settings').at(-1).payload.revision, 2);
+});

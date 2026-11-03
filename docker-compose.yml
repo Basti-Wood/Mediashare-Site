@@ -14,6 +14,7 @@ services:
       - ./HTML:/app/HTML:ro
       - ./src:/app/src:ro
       - ./styles:/app/styles:ro
+      - ./streamdeck:/app/streamdeck:ro
       - ./index.html:/app/index.html:ro
       # Keep uploaded MP3s, saved playlists and user settings across rebuilds.
       - ./data:/app/data

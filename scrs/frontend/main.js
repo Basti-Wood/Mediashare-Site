@@ -27,6 +27,7 @@ const nowPlaying      = document.getElementById('now-playing-info');
 const skipCurrentBtn  = document.getElementById('skip-current-btn');
 const pauseCurrentBtn = document.getElementById('pause-current-btn');
 let channelAudioPaused = false;
+let channelAudioRevision = -1;
 const queueCount      = document.getElementById('queue-count');
 const queueEmpty      = document.getElementById('queue-empty');
 const queueTable      = document.getElementById('queue-table');
@@ -905,7 +906,9 @@ async function skipCurrent() {
 
 if (skipCurrentBtn) skipCurrentBtn.addEventListener('click', skipCurrent);
 
-function renderChannelPause(settings) {
+function renderChannelPause(settings, revision) {
+    if (Number.isFinite(revision) && revision < channelAudioRevision) return;
+    if (Number.isFinite(revision)) channelAudioRevision = revision;
     channelAudioPaused = settings.paused === true;
     pauseCurrentBtn.textContent = channelAudioPaused ? '▶ Resume' : '⏸ Pause';
     pauseCurrentBtn.setAttribute('aria-pressed', String(channelAudioPaused));
@@ -915,11 +918,11 @@ async function loadChannelAudioSettings() {
     const channel = currentChannel;
     if (!channel) return;
     try {
-        const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/audio-settings`);
+        const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/audio-settings`, { cache: 'no-store' });
         if (!res.ok) throw new Error(res.status);
         const data = await res.json();
         if (channel !== currentChannel) return;
-        renderChannelPause(data.settings);
+        renderChannelPause(data.settings, data.revision);
         pauseCurrentBtn.disabled = false;
     } catch {
         if (channel === currentChannel) setMyListPlaybackStatus('Could not load saved audio settings.', true);
@@ -937,7 +940,7 @@ pauseCurrentBtn.addEventListener('click', async () => {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Could not pause/resume playback.');
-        if (channel === currentChannel) renderChannelPause(data.settings);
+        if (channel === currentChannel) renderChannelPause(data.settings, data.revision);
     } catch (err) {
         if (channel === currentChannel) setMyListPlaybackStatus(err.message, true);
     } finally {
@@ -956,6 +959,7 @@ function switchChannel(channel) {
     if (socket && currentChannel) socket.emit('leave:channel', currentChannel);
 
     currentChannel = channel;
+    channelAudioRevision = -1;
     window.mediashareStreamDeck?.setChannel(channel);
     renderChannelPause({ paused: false });
     pauseCurrentBtn.disabled = true;
@@ -1077,8 +1081,8 @@ async function init() {
         // and the loop setting in sync across dashboards.
         loadMyList();
     });
-    socket.on('audio:settings', ({ channel, settings }) => {
-        if (channel === currentChannel) renderChannelPause(settings);
+    socket.on('audio:settings', ({ channel, settings, revision }) => {
+        if (channel === currentChannel) renderChannelPause(settings, revision);
     });
     socket.on('local:library:update', ({ channel }) => {
         if (channel === currentChannel) { loadLocalPlaylists(); loadLocalFiles(); }

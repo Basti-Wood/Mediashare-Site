@@ -140,3 +140,17 @@ test('a failed partial transcode breaks the stream instead of reporting normal c
         await response.arrayBuffer();
     });
 });
+
+test('duration info and audio share extraction without exposing the signed URL or creating another player', async t => {
+    const { h, tools } = await setup(t, { metadata: { url: 'https://cdn.example.test/private-audio', duration: 123.5, http_headers: { 'User-Agent': 'private-agent' } } });
+    const [info, audio] = await Promise.all([fetch(h.base + '/api/yt-audio/AAAAAAAAAAA/info'), h.audio()]);
+    assert.equal(info.status, 200);
+    assert.deepEqual(await info.json(), { duration: 123.5 });
+    assert.equal(await audio.text(), 'ID3 test audio');
+    assert.equal(tools.resolutions.length, 1);
+    assert.equal(tools.transcodes.length, 1);
+    const again = await fetch(h.base + '/api/yt-audio/AAAAAAAAAAA/info');
+    assert.deepEqual(await again.json(), { duration: 123.5 });
+    assert.equal(tools.resolutions.length, 1);
+    assert.equal((await fetch(h.base + '/api/yt-audio/bad/info')).status, 400);
+});

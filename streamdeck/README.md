@@ -4,9 +4,9 @@ Install `com.bastiwood.mediashare.streamDeckPlugin` by double-clicking it, or us
 the dashboard's **Stream Deck → Download the Mediashare plugin** link.
 
 The **Skip current song** key advances the current track. The **Media volume /
-Pause** encoder adjusts the media volume and pauses/resumes when pressed. Assign
-the latter to a dial on Stream Deck +. Dial sensitivity defaults to 2 percentage
-points per tick and is configurable from 1 to 10.
+Pause** encoder adjusts the media volume and pauses/resumes when pressed or when
+its touch screen is tapped (including a hold). Assign the latter to a dial on Stream Deck +. Dial sensitivity defaults to 2 percentage
+points per tick and is configurable from 0.01 to 10, including 0.5% steps.
 
 In the dashboard, create a connection token for your channel. In either action's
 settings, enter the website address and token, then click **Connect**. The plugin
@@ -14,6 +14,10 @@ verifies the token before saving it in Stream Deck's global plugin settings.
 Both actions share that connection. Use HTTPS, or HTTP localhost for development.
 Tokens grant only playback control of their paired channel. Use the dashboard's
 **Disconnect** button to revoke a token; replacing it revokes the previous copy.
+
+Plugin version **1.0.1** adds touch-screen pause/resume and fractional percentage
+feedback. Install the updated package over version 1.0.0; its saved connection
+remains available.
 
 The dial refreshes shared playback settings once a second. Relative adjustments
 are computed by the server, so website edits and rapid dial turns do not overwrite
@@ -59,11 +63,11 @@ privately under `data/streamdeck`, excluded from Git and Docker build contexts.
 The plugin sends `Authorization: Bearer msd_…` to:
 
 - `GET /api/streamdeck/state`: paired channel, shared `settings` (volume/paused)
-  and the current `playbackId`, when a player has reported one.
+  the monotonically increasing settings `revision`, and the current `playbackId`, when a player has reported one.
 - `POST /api/streamdeck/control`: an `action`, unique `requestId` (8–80 letters,
   digits, underscores or hyphens), and action-specific parameters. Actions are
   `skip` (optional `playbackId` to guard against an already finished song),
-  `adjust-volume` (nonzero integer `delta` between -100 and 100), and
+  `adjust-volume` (finite nonzero numeric `delta` between -100 and 100), and
   `toggle-pause`. The server always uses the token's channel.
 
 Responses include the updated shared state. Reusing the same request ID and

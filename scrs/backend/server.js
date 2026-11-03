@@ -751,7 +751,7 @@ function resolveYouTubeAudioSource(videoId) {
                         if (/^(user-agent|referer|origin|accept)$/i.test(name)
                             && typeof value === 'string' && !/[\r\n]/.test(value)) headers[name] = value;
                     }
-                    resolve({ url, headers });
+                    resolve({ url, headers, duration: Number.isFinite(data.duration) && data.duration > 0 ? data.duration : null });
                 } catch (err) {
                     reject(new Error(`Could not read yt-dlp audio metadata: ${err.message}`));
                 }
@@ -763,33 +763,40 @@ function resolveYouTubeAudioSource(videoId) {
     return pending;
 }
 
-// GET a same-origin, loudness-normalised audio stream for a YouTube video id.
-// No auth: the overlay (OBS browser source / background tab) has no session,
-// same as the other /api/channels endpoints.
-app.get('/api/yt-audio/:videoId', async (req, res) => {
-    const videoId = String(req.params.videoId || '');
-    if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
-        return res.status(400).json({ error: 'Invalid video id.' });
-    }
-
-    let source;
+async function cachedYouTubeSource(videoId) {
     const cached = ytAudioCache.get(videoId);
-    if (cached && cached.expires > Date.now()) {
-        source = cached.source;
-    } else {
-        try {
-            source = await resolveYouTubeAudioSource(videoId);
-            ytAudioCache.set(videoId, { source, expires: Date.now() + YT_AUDIO_TTL_MS });
-        } catch (e) {
-            console.error(`yt-dlp failed for ${videoId}:`, e.message || e);
-            return res.status(502).json({
-                error: e.code === 'ENOENT' ? 'yt-dlp is not installed on the server.' : 'Could not resolve YouTube audio.',
-                code: e.code === 'ENOENT' ? 'YTDLP_MISSING' : 'YOUTUBE_RESOLVE_FAILED'
-            });
-        }
-    }
+    if (cached && cached.expires > Date.now()) return cached.source;
+    const source = await resolveYouTubeAudioSource(videoId);
+    ytAudioCache.set(videoId, { source, expires: Date.now() + YT_AUDIO_TTL_MS });
+    return source;
+}
+function validYouTubeAudioId(req, res) {
+    if (/^[A-Za-z0-9_-]{11}$/.test(req.params.videoId || '')) return true;
+    res.status(400).json({ error: 'Invalid video id.' });
+    return false;
+}
+function youtubeResolutionError(res, err) {
+    res.status(502).json({ error: err.code === 'ENOENT' ? 'yt-dlp is not installed on the server.' : 'Could not resolve YouTube audio.',
+        code: err.code === 'ENOENT' ? 'YTDLP_MISSING' : 'YOUTUBE_RESOLVE_FAILED' });
+}
 
-    if (!res.destroyed) streamNormalizedAudio(source, res, videoId, () => ytAudioCache.delete(videoId));
+// The audio-only player gets duration from this same cached resolver, without
+// loading a YouTube iframe or exposing signed stream URLs/headers to clients.
+app.get('/api/yt-audio/:videoId/info', async (req, res) => {
+    if (!validYouTubeAudioId(req, res)) return;
+    try {
+        const source = await cachedYouTubeSource(req.params.videoId);
+        res.json({ duration: source.duration });
+    } catch (err) { youtubeResolutionError(res, err); }
+});
+
+// Same-origin, normalized native audio for dashboard, pop-out and OBS.
+app.get('/api/yt-audio/:videoId', async (req, res) => {
+    if (!validYouTubeAudioId(req, res)) return;
+    try {
+        const source = await cachedYouTubeSource(req.params.videoId);
+        if (!res.destroyed) streamNormalizedAudio(source, res, req.params.videoId, () => ytAudioCache.delete(req.params.videoId));
+    } catch (err) { youtubeResolutionError(res, err); }
 });
 
 // Transcodes a (possibly remote) audio source through ffmpeg with loudness
@@ -858,7 +865,8 @@ function streamNormalizedAudio(source, res, label, onFailure = () => {}) {
 // ── Overlay endpoints (no auth — used by OBS browser source) ─────────────────
 
 app.get('/api/channels/:ch/audio-settings', (req, res) => {
-    res.json({ settings: audioSettings.get(req.params.ch) });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ settings: audioSettings.get(req.params.ch), revision: audioSettings.revision(req.params.ch) });
 });
 
 app.post('/api/channels/:ch/audio-settings', requireAuth, (req, res) => {
@@ -867,8 +875,8 @@ app.post('/api/channels/:ch/audio-settings', requireAuth, (req, res) => {
         return res.status(403).json({ error: 'Access denied.' });
     try {
         const settings = audioSettings.update(channel, req.body);
-        io.to(`ch:${channel}`).emit('audio:settings', { channel, settings });
-        res.json({ success: true, settings });
+        emitAudioSettings(channel, settings);
+        res.json({ success: true, settings, revision: audioSettings.revision(channel) });
     } catch (err) {
         res.status(err.status || 500).json({ error: err.status ? err.message : 'Could not save audio settings.' });
     }
@@ -971,14 +979,17 @@ app.post('/api/channels/:ch/next', async (req, res) => {
 
 // ── Stream Deck pairing and channel-scoped remote controls ─────────────────
 
+function emitAudioSettings(channel, settings) {
+    io.to(`ch:${channel}`).emit('audio:settings', { channel, settings, revision: audioSettings.revision(channel) });
+}
 function streamDeckState(channel) {
-    return { channel, settings: audioSettings.get(channel), playbackId: playbackByChannel.get(channel)?.id || null };
+    return { channel, settings: audioSettings.get(channel), revision: audioSettings.revision(channel), playbackId: playbackByChannel.get(channel)?.id || null };
 }
 const streamDeckCommand = createStreamDeckCommands({
     audioSettings,
     state: streamDeckState,
     skip: (channel, playbackId) => advancePlayback(channel, playbackId, true),
-    onSettings: (channel, settings) => io.to(`ch:${channel}`).emit('audio:settings', { channel, settings })
+    onSettings: emitAudioSettings
 });
 
 function requireStreamDeck(req, res, next) {
