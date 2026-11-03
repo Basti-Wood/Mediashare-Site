@@ -7,6 +7,7 @@ const path = require('node:path');
 const http = require('node:http');
 const vm = require('node:vm');
 const { createRequire } = require('node:module');
+const { createMediaTools } = require('./media-tools');
 
 const serverFile = path.resolve(__dirname, '../../scrs/backend/server.js');
 const serverRequire = createRequire(serverFile);
@@ -16,6 +17,7 @@ async function createTestServer(options = {}) {
     const queues = new Map();
     const calls = [];
     const events = [];
+    const cacheTools = createMediaTools();
     const accounts = options.accounts || ['alice', 'bob'].map(channel => ({
         username: channel, password: 'test-only', channel, access_accounts: []
     }));
@@ -35,6 +37,10 @@ async function createTestServer(options = {}) {
         Math: Object.assign(Object.create(Math), { random: options.random || Math.random }),
         require(name) {
             if (name === 'dotenv') return { config() {} };
+            if (name === './youtube-cache') return {
+                createYouTubeCache: settings => serverRequire(name).createYouTubeCache({ ...settings,
+                    root: path.join(localRoot, '.youtube-cache'), spawn: options.cacheSpawn || cacheTools.spawn })
+            };
             if (name === 'child_process' && (options.spawn || options.execFile))
                 return { ...serverRequire(name),
                     ...(options.spawn ? { spawn: options.spawn } : {}),
@@ -95,8 +101,8 @@ async function createTestServer(options = {}) {
             return { ok: true, json: async () => ({ success: true }) };
         }
     };
-    const { playlistImporter, sessionStore, io } = vm.runInNewContext(
-        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter, sessionStore, io });', sandbox, { filename: serverFile });
+    const { playlistImporter, sessionStore, io, youtubeCache } = vm.runInNewContext(
+        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter, sessionStore, io, youtubeCache });', sandbox, { filename: serverFile });
     server.listen = listen;
     await new Promise(resolve => listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
@@ -116,7 +122,7 @@ async function createTestServer(options = {}) {
     }
 
     return {
-        base, calls, events, queues, request, login, localRoot, accounts, sessionStore,
+        base, calls, events, queues, request, login, localRoot, accounts, sessionStore, youtubeCache, cacheTools,
         settleImport(channel = 'alice') { return playlistImporter.settle(channel); },
         failPromotion(kind) { failPromotion = kind; },
         beforePromotion(action) { beforePromotion = action; },
@@ -128,6 +134,7 @@ async function createTestServer(options = {}) {
                 if (job?.status === 'running') playlistImporter.cancel(channel, job.id);
                 await playlistImporter.settle(channel);
             }
+            await youtubeCache.close();
             server.closeAllConnections();
             if (options.realSockets) await new Promise(resolve => io.close(resolve));
             else await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
