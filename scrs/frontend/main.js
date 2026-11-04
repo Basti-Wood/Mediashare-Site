@@ -950,8 +950,7 @@ pauseCurrentBtn.addEventListener('click', async () => {
 
 // ── Channel switching ─────────────────────────────────────────────────────────
 
-// The full standalone overlay URL for the current channel (no &controls), used
-// by the OBS copy button and the pop-out window. Kept in sync by switchChannel.
+// OBS has its own audio output. The pop-out adds videoOnly=1 to follow silently.
 let currentOverlayUrl = '';
 
 function switchChannel(channel) {
@@ -1032,14 +1031,12 @@ if (copyObsUrlBtn) {
     });
 }
 
-// Open the player in its own browser window. A separate OS-level window keeps
-// running when the MAIN browser window is minimised (unlike a background tab),
-// so this is the best background-playback option outside of OBS.
+// A silent picture-only follower uses the same server playback clock.
 if (popoutBtn) {
     popoutBtn.addEventListener('click', () => {
         if (!currentOverlayUrl) return;
         window.open(
-            `${currentOverlayUrl}&controls=1`,
+            `${currentOverlayUrl}&videoOnly=1`,
             'mediashare_player',
             'width=860,height=520,menubar=no,toolbar=no,location=no,status=no'
         );

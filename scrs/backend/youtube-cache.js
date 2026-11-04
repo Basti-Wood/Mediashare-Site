@@ -36,7 +36,7 @@ function publicFailure(err) {
 function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
     maxBytes = 1024 * MIB, maxEntryBytes = 128 * MIB, ttlMs = 6 * 60 * 60 * 1000,
     downloadTimeoutMs = 180000, processTimeoutMs = 120000, concurrency = 2,
-    loudnorm = 'loudnorm=I=-14:TP=-1.5:LRA=11', mediaType = 'audio', onError = () => {} } = {}) {
+    loudnorm = 'loudnorm=I=-14:TP=-1.5:LRA=11', mediaType = 'audio', onError = () => {}, onActivity = () => {} } = {}) {
     const video = mediaType === 'video';
     const extension = video ? 'mp4' : 'mp3';
     const formats = video ? VIDEO_FORMATS : FORMATS;
@@ -49,8 +49,12 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
     const leases = new Map();
     const stageRoot = path.join(root, '.staging');
     let closed = false;
+    let prefetchPaused = false;
     let order = 0;
     fs.mkdirSync(stageRoot, { recursive: true });
+    const activity = () => {
+        try { onActivity([...jobs.values()].some(job => !['ready', 'failed'].includes(job.state))); } catch {}
+    };
 
     const fileFor = id => path.join(root, id + '.' + extension);
     const metaFor = id => path.join(root, id + '.json');
@@ -130,6 +134,7 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
             job.killTimer.unref();
         } else if (job.state === 'queued') {
             job.state = 'failed'; job.error = job.cancelled; job.retryAt = now(); job.reject(job.error);
+            activity();
         }
     }
     function sweep() {
@@ -254,6 +259,13 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
             }
             throw lastError;
         } catch (err) {
+            // Priority changes suspend a prefetch without failing its shared
+            // promise or showing a playback error. Retry after viewers finish.
+            if (job.cancelled?.code === 'PREEMPTED' && !closed && wanted(job.id)) {
+                job.state = 'queued';
+                job.cancelled = null;
+                return;
+            }
             job.state = 'failed';
             job.error = publicFailure(job.cancelled || err);
             job.retryAt = now() + (job.cancelled ? 0 : 60000);
@@ -261,12 +273,14 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
             if (!job.cancelled) { try { onError(job.id, job.error); } catch {} }
         } finally {
             try { fs.rmSync(job.stage, { recursive: true, force: true }); } catch {}
+            activity();
         }
     }
     function pump() {
         if (closed) return;
         while (active.size < concurrency) {
-            const queued = [...jobs.values()].filter(job => job.state === 'queued' && !job.cancelled)
+            const queued = [...jobs.values()].filter(job => job.state === 'queued' && !job.cancelled && !active.has(job)
+                && (!prefetchPaused || job.priority === 0))
                 .sort((a, b) => a.priority - b.priority || a.order - b.order);
             const job = queued.find(job => job.priority === 0 || [...active].filter(item => item.priority > 0).length < Math.max(1, concurrency - 1));
             if (!job) return;
@@ -291,6 +305,7 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
             job.promise = new Promise((resolve, reject) => { job.resolve = resolve; job.reject = reject; });
             job.promise.catch(() => {});
             jobs.set(id, job);
+            activity();
         }
         job.priority = Math.min(priority, job.priority);
         if (priority === 0 && !active.has(job) && active.size >= concurrency) {
@@ -311,6 +326,14 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
     return {
         status,
         prepare,
+        pausePrefetch(paused) {
+            if (prefetchPaused === !!paused) return;
+            prefetchPaused = !!paused;
+            if (prefetchPaused) for (const job of active) {
+                if (job.priority > 0 && job.state !== 'queued') stop(job, error('PREEMPTED', 'Prefetch paused for viewer video downloads.', 409));
+            }
+            pump();
+        },
         request(id, options) { prepare(id, options).catch(() => {}); return status(id); },
         acquire(id) {
             validId(id);

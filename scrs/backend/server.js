@@ -16,6 +16,7 @@ const { createMusicLibrary } = require('./music-library');
 const { createAudioSettings } = require('./audio-settings');
 const { createYouTubeCache } = require('./youtube-cache');
 const { upcomingMedia } = require('./prefetch-queue');
+const { createPlaybackClock } = require('./playback-clock');
 const { createStreamDeckTokens, createStreamDeckCommands } = require('./streamdeck');
 const { FileSessionStore, persistentSessionSecret, REMEMBER_LOGIN_MS } = require('./session-store');
 
@@ -24,6 +25,7 @@ const server = http.createServer(app);
 const io     = new Server(server);
 const LOCAL_MEDIA_ROOT = process.env.LOCAL_MEDIA_ROOT || path.join(__dirname, '../..', 'data', 'local-media');
 const musicLibrary = createMusicLibrary(path.join(LOCAL_MEDIA_ROOT, '.library'));
+const playbackClock = createPlaybackClock({ onChange: state => io.to(`ch:${state.channel}`).emit('playback:sync', state) });
 const audioSettings = createAudioSettings(process.env.AUDIO_SETTINGS_ROOT || path.join(__dirname, '../..', 'data', 'audio-settings'));
 const sessionDirectory = process.env.SESSION_STORE_ROOT || path.join(__dirname, '../..', 'data', 'sessions');
 const sessionSecret = process.env.SESSION_SECRET || persistentSessionSecret(sessionDirectory);
@@ -330,6 +332,7 @@ async function withPlaybackLock(channel, action) {
 function playbackIdFor(channel, item) {
     if (!item) {
         playbackByChannel.delete(channel);
+        playbackClock.clear(channel);
         return null;
     }
     const signature = JSON.stringify([
@@ -341,6 +344,7 @@ function playbackIdFor(channel, item) {
         playback = { signature, id: randomUUID() };
         playbackByChannel.set(channel, playback);
     }
+    playbackClock.select(channel, playback.id, audioSettings.get(channel), audioSettings.revision(channel));
     return playback.id;
 }
 
@@ -712,6 +716,7 @@ const youtubeVideoCacheMB = cacheSetting('YOUTUBE_VIDEO_CACHE_MAX_MB', 1024, 16,
 const youtubeVideoCache = createYouTubeCache({
     root: process.env.YOUTUBE_VIDEO_CACHE_ROOT || path.join(__dirname, '../..', 'data', 'youtube-video-cache'),
     mediaType: 'video',
+    onActivity: busy => youtubeCache.pausePrefetch(busy),
     maxBytes: youtubeVideoCacheMB * 1024 * 1024,
     maxEntryBytes: Math.min(youtubeVideoCacheMB, cacheSetting('YOUTUBE_VIDEO_CACHE_ENTRY_MB', 256, 1, 1024)) * 1024 * 1024,
     ttlMs: cacheSetting('YOUTUBE_CACHE_TTL_HOURS', 6, 0.1, 168) * 60 * 60 * 1000,
@@ -719,7 +724,7 @@ const youtubeVideoCache = createYouTubeCache({
     loudnorm: LOUDNORM_FILTER,
     onError: (id, err) => console.error(`YouTube video preparation ${id}: ${err.code}: ${err.message}`)
 });
-const youtubeMediaCaches = { audio: youtubeCache, video: youtubeVideoCache };
+const youtubeMediaCaches = { video: youtubeVideoCache, audio: youtubeCache };
 function validYouTubeMediaId(req, res) {
     if (/^[A-Za-z0-9_-]{11}$/.test(req.params.videoId || '')) return true;
     res.status(400).json({ error: 'Invalid video id.' });
@@ -793,6 +798,21 @@ app.post('/api/channels/:ch/audio-settings', requireAuth, (req, res) => {
     }
 });
 
+// Lightweight clock endpoints never promote or consume queue entries.
+app.get('/api/channels/:ch/playback', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ playback: playbackClock.snapshot(req.params.ch) });
+});
+app.post('/api/channels/:ch/playback/report', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(playbackClock.report(req.params.ch, req.body));
+});
+app.post('/api/channels/:ch/playback/seek', requireAuth, (req, res) => {
+    if (!hasAccess(req.session.user, req.params.ch)) return res.status(403).json({ error: 'Access denied.' });
+    try { res.json(playbackClock.seek(req.params.ch, req.body)); }
+    catch (err) { res.status(err.status || 500).json({ error: err.status ? err.message : 'Could not seek playback.' }); }
+});
+
 // Get the current (first) item — respects play mode.
 // For 'mylist'/'switch' sources, owner songs are routed THROUGH the Basti queue
 // (front row) so they appear in the top slot for the Twitch bot. We push the
@@ -835,7 +855,7 @@ app.get('/api/channels/:ch/current', async (req, res) => {
                 !waitingForCurrent && !topIsOwner && hasMyListSong &&
                 (playNext || effectiveSource === 'mylist' || !hasViewerSong);
 
-            if (wantMyList) {
+            if (wantMyList && req.query.observe !== '1') {
                 const pushed = await promoteMyListHeadToBasti(ch);
                 if (pushed) {
                     const data = await bastiGet(`/getallmedia/${ch}`);
@@ -854,10 +874,14 @@ app.get('/api/channels/:ch/current', async (req, res) => {
                 isOwner: item => isOwnerSong(item, ch), count: YOUTUBE_PREFETCH_COUNT });
             for (const [type, cache] of Object.entries(youtubeMediaCaches)) {
                 const matches = item => item && (item._source === 'requests' ? 'video' : 'audio') === type;
-                cache.plan(ch, matches(current) ? parseYouTubeVideoId(current.url || current.media || '') : null,
-                    upcoming.filter(matches).map(item => parseYouTubeVideoId(item.url || item.media || '')).filter(Boolean));
+                // Warm viewer requests first even while personal songs are
+                // playing. Download priority does not change the playback mode.
+                const candidates = type === 'video' ? media.slice(1).filter(item => !isOwnerSong(item, ch)) : upcoming.filter(matches);
+                const ids = [...new Set(candidates.map(item => parseYouTubeVideoId(item.url || item.media || '')).filter(Boolean))]
+                    .slice(0, YOUTUBE_PREFETCH_COUNT);
+                cache.plan(ch, matches(current) ? parseYouTubeVideoId(current.url || current.media || '') : null, ids);
             }
-            res.json({ current });
+            res.json({ current, playback: playbackClock.snapshot(ch) });
         } catch (e) {
             console.error('current failed:', e.message || e);
             res.status(502).json({ error: 'Could not reach api.bastiwood.com' });
@@ -895,6 +919,7 @@ async function advancePlayback(ch, playbackId, onlyIfPlaying = false, unavailabl
         // Even a save failure must not let another player remove its successor.
         personalListWaitByChannel.delete(ch);
         playbackByChannel.delete(ch);
+        playbackClock.clear(ch);
         promotedMyListByChannel.delete(ch);
         if (unavailable) {
             // Retire confirmed unavailable tracks from the active personal list,
@@ -922,6 +947,7 @@ app.post('/api/channels/:ch/next', async (req, res) => {
 // ── Stream Deck pairing and channel-scoped remote controls ─────────────────
 
 function emitAudioSettings(channel, settings) {
+    playbackClock.settings(channel, settings, audioSettings.revision(channel));
     io.to(`ch:${channel}`).emit('audio:settings', { channel, settings, revision: audioSettings.revision(channel) });
 }
 function streamDeckState(channel) {
@@ -1465,6 +1491,8 @@ io.on('connection', socket => {
 
         joinedChannels.add(channel);
         socket.join(`ch:${channel}`);
+        const playback = playbackClock.snapshot(channel);
+        if (playback) socket.emit('playback:sync', playback);
         incrementSubscriberCount(channel);
         connectUpstreamChannel(channel);
     });

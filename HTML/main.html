@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="../styles/bulma/css/bulma.min.css">
     <link rel="stylesheet" href="../styles/mystyles.css?v=saved-playlists-1">
 </head>
-<body class="dashboard-body" data-build="request-video-1">
+<body class="dashboard-body" data-build="sync-player-1">
 
     <!-- ── Navbar ──────────────────────────────────────────────────────────── -->
     <nav class="navbar is-dark" role="navigation">
@@ -37,7 +37,7 @@
         <!-- Left: overlay preview -->
         <div class="column is-7 pr-3">
             <div class="box preview-box">
-                <p class="heading mb-2">Audio player</p>
+                <p class="heading mb-2">Media player</p>
                 <iframe id="preview-frame"
                         class="preview-frame"
                         src="overlay.html?channel="
@@ -58,13 +58,12 @@
                         <button id="copy-obs-url-btn" class="button is-small is-link">Copy</button>
                     </div>
                     <div class="control">
-                        <button id="popout-btn" class="button is-small is-info" title="Open the player in its own window so it keeps playing when this window is minimised">Pop out</button>
+                        <button id="popout-btn" class="button is-small is-info" title="Show the synchronized video in a silent window; audio stays in the main player">Video pop-out</button>
                     </div>
                 </div>
                 <p class="is-size-7 has-text-grey mt-1">
-                    Add this as a Browser Source in OBS — it keeps playing even when this
-                    window is minimised. In a normal browser tab, use “Pop out” below to
-                    keep playback alive in the background.
+                    Add this as a Browser Source in OBS for synchronized video and audio.
+                    Video pop-out shows the same picture silently; sound stays in the main player.
                 </p>
             </div>
             <details class="box mt-3">
@@ -331,7 +330,7 @@
 
     <!-- Socket.io client -->
     <script src="/socket.io/socket.io.js"></script>
-    <script src="../scrs/frontend/streamdeck.js?v=request-video-1"></script>
-    <script src="../scrs/frontend/main.js?v=request-video-1"></script>
+    <script src="../scrs/frontend/streamdeck.js?v=sync-player-1"></script>
+    <script src="../scrs/frontend/main.js?v=sync-player-1"></script>
 </body>
 </html>

@@ -37,6 +37,9 @@ async function createTestServer(options = {}) {
         Math: Object.assign(Object.create(Math), { random: options.random || Math.random }),
         require(name) {
             if (name === 'dotenv') return { config() {} };
+            if (name === './playback-clock') return {
+                createPlaybackClock: settings => serverRequire(name).createPlaybackClock({ ...settings, ...(options.now ? { now: options.now } : {}) })
+            };
             if (name === './youtube-cache') return {
                 createYouTubeCache: settings => serverRequire(name).createYouTubeCache({ ...settings,
                     root: path.join(localRoot, settings.mediaType === 'video' ? '.youtube-video-cache' : '.youtube-cache'),
@@ -102,8 +105,8 @@ async function createTestServer(options = {}) {
             return { ok: true, json: async () => ({ success: true }) };
         }
     };
-    const { playlistImporter, sessionStore, io, youtubeCache, youtubeVideoCache, musicLibrary } = vm.runInNewContext(
-        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter, sessionStore, io, youtubeCache, youtubeVideoCache, musicLibrary });', sandbox, { filename: serverFile });
+    const { playlistImporter, sessionStore, io, youtubeCache, youtubeVideoCache, musicLibrary, playbackClock } = vm.runInNewContext(
+        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter, sessionStore, io, youtubeCache, youtubeVideoCache, musicLibrary, playbackClock });', sandbox, { filename: serverFile });
     server.listen = listen;
     await new Promise(resolve => listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
@@ -123,7 +126,7 @@ async function createTestServer(options = {}) {
     }
 
     return {
-        base, calls, events, queues, request, login, localRoot, accounts, sessionStore, youtubeCache, youtubeVideoCache, cacheTools, musicLibrary,
+        base, calls, events, queues, request, login, localRoot, accounts, sessionStore, youtubeCache, youtubeVideoCache, cacheTools, musicLibrary, playbackClock,
         settleImport(channel = 'alice') { return playlistImporter.settle(channel); },
         failPromotion(kind) { failPromotion = kind; },
         beforePromotion(action) { beforePromotion = action; },
