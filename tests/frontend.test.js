@@ -35,6 +35,14 @@ function frontend(h, file, cookie, options = {}) {
             querySelectorAll() { return []; }, querySelector() { return null; },
             async fire(event, data = {}) { return this.handlers.get(event)?.(data); }
         });
+        if (id === 'media-player' && !elements.get(id).mediaInitialized) {
+            const media = elements.get(id);
+            Object.assign(media, { mediaInitialized: true, src: '', paused: true, currentTime: 0, duration: NaN,
+                play() { this.paused = false; plays.push(this.src); return Promise.resolve(); },
+                pause() { this.paused = true; }, load() {},
+                removeAttribute(name) { if (name === 'src') this.src = ''; delete this.attributes[name]; } });
+            audios.push(media);
+        }
         return elements.get(id);
     }
     const tabs = ['requests', 'mylist', 'local'].map(tab => {
@@ -59,17 +67,9 @@ function frontend(h, file, cookie, options = {}) {
         setTimeout(callback, delay) { const id = ++timerSerial; timers.set(id, { callback, delay }); return id; },
         clearTimeout(id) { timers.delete(id); }, setInterval() { return 1; }, clearInterval() {},
         io: () => ({ on(event, handler) { socketHandlers.set(event, handler); }, emit() {} }),
-        fetch: (url, request = {}) => /\/api\/yt-audio\/[A-Za-z0-9_-]{11}\/info(?:\?|$)/.test(url)
+        fetch: (url, request = {}) => /\/api\/yt-(?:audio|video)\/[A-Za-z0-9_-]{11}\/info(?:\?|$)/.test(url)
             ? (options.info ? options.info(url) : Promise.resolve(new Response(JSON.stringify({ status: 'ready', duration: 180 }), { headers: { 'Content-Type': 'application/json' } })))
             : fetch(h.base + url, { ...request, headers: { ...request.headers, ...(cookie ? { Cookie: cookie } : {}) } }),
-        Audio: class {
-            constructor() { this.src = ''; this.paused = true; this.currentTime = 0; this.duration = NaN; this.handlers = new Map(); audios.push(this); }
-            addEventListener(event, handler) { this.handlers.set(event, handler); }
-            play() { this.paused = false; plays.push(this.src); return Promise.resolve(); }
-            pause() { this.paused = true; }
-            load() {}
-            removeAttribute(name) { if (name === 'src') this.src = ''; }
-        }
     });
     const source = fs.readFileSync(path.resolve(__dirname, '../scrs/frontend', file), 'utf8');
     const ready = vm.runInContext(source, context, { filename: file });
@@ -270,7 +270,7 @@ test('overlay ignores a stale current response arriving after advancement', asyn
     assert.deepEqual(ui.errors, []);
 });
 
-test('a failed YouTube audio stream stays queued and never creates a video player', async t => {
+test('a failed personal YouTube song stays queued with its video hidden', async t => {
     const h = await setup(t);
     await h.add('AAAAAAAAAAA');
     const ui = frontend(h, 'overlay.js');
@@ -676,7 +676,7 @@ test('late preparation from a skipped song cannot play over the next track or ch
         }
         return original(url, options);
     };
-    const pending = ui.run("prepareYouTubeAudio('AAAAAAAAAAA', currentItemId)");
+    const pending = ui.run("prepareYouTubeMedia('AAAAAAAAAAA', currentItemId)");
     await until(() => held);
     await ui.run('advance()');
     await until(() => ui.plays.length === 2 && ui.run('trackDuration') === 180);
@@ -723,7 +723,7 @@ test('preparation errors show the server reason, keep the song queued and allow 
     const ui = frontend(h, 'overlay.js', h.cookie, { info: async url => {
         checks.push(url);
         return new Response(JSON.stringify(url.includes('?retry=1') ? { status: 'ready', duration: 180 }
-            : { status: 'failed', error: 'YouTube is rate-limiting this server. Wait a little and retry.' }), { status: url.includes('?retry=1') ? 200 : 502 });
+            : { status: 'failed', code: 'YOUTUBE_RATE_LIMIT', error: 'YouTube is rate-limiting this server. Wait a little and retry.' }), { status: url.includes('?retry=1') ? 200 : 502 });
     } });
     await ui.ready;
     const current = ui.run('currentItemId');
@@ -749,5 +749,86 @@ test('Skip cancels pending preparation polls and starts the next prepared song o
     await until(() => ui.plays.length === 1);
     assert.equal(ui.plays[0], '/api/yt-audio/BBBBBBBBBBB');
     assert.throws(() => ui.runTimer(1000), /No timer/);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
+});
+
+test('viewer requests show native MP4 video and shared controls; the same song in My List stays audio-only', async t => {
+    const h = await setup(t);
+    h.queues.set('alice', [{ id: 'request-a', media: 'https://youtu.be/AAAAAAAAAAA', username: 'viewer' }]);
+    await h.add('AAAAAAAAAAA');
+    await h.api('/api/channels/alice/audio-settings', 'POST', { volume: 0.5, paused: true });
+    const ui = frontend(h, 'overlay.js', h.cookie);
+    await ui.ready;
+    const media = ui.audios[0];
+    assert.equal(ui.run('playbackMode'), 'youtube-video');
+    assert.equal(media.src, '/api/yt-video/AAAAAAAAAAA');
+    assert.equal(media.hidden, false);
+    assert.equal(ui.elements.get('audio-card').hidden, true);
+    assert.equal(ui.plays.length, 0);
+    media.handlers.get('ended')();
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+    const remotePause = async paused => {
+        await h.api('/api/channels/alice/audio-settings', 'POST', { paused });
+        ui.emitSocket('audio:settings', h.events.filter(event => event.event === 'audio:settings').at(-1).payload);
+    };
+    await remotePause(false);
+    assert.equal(ui.plays.length, 1);
+    assert.equal(ui.outputs[0].gain.value, 0.005);
+    assert.equal(ui.outputs[0].audio, media);
+    await remotePause(true);
+    assert.equal(media.paused, true);
+    await remotePause(false);
+    media.handlers.get('ended')();
+    await until(() => media.src === '/api/yt-audio/AAAAAAAAAAA');
+    assert.equal(ui.run('playbackMode'), 'youtube-audio');
+    assert.equal(media.hidden, true);
+    assert.equal(ui.elements.get('audio-card').hidden, false);
+    assert.equal(ui.audios.length, 1);
+    assert.equal(ui.outputs.length, 1);
+    assert.equal(ui.outputs[0].sourceCount, 1);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
+});
+
+test('anonymous OBS shows video for a requested song without a YouTube iframe or extra audio source', async t => {
+    const h = await setup(t);
+    h.queues.set('alice', [{ id: 'request-a', media: 'https://youtu.be/AAAAAAAAAAA', username: 'viewer' }]);
+    const ui = frontend(h, 'overlay.js', undefined, { search: '?channel=alice' });
+    await ui.ready;
+    assert.equal(ui.audios[0].hidden, false);
+    assert.equal(ui.audios[0].src, '/api/yt-video/AAAAAAAAAAA');
+    assert.equal(ui.outputs.length, 1);
+    assert.equal(ui.elements.get('audio-card').hidden, true);
+    assert.equal(ui.context.window.onYouTubeIframeAPIReady, undefined);
+});
+
+test('a confirmed private requested video is skipped automatically and the next request plays as video', async t => {
+    const tools = require('./helpers/media-tools').createMediaTools({ downloadFailure: call => call.args.at(-1).endsWith('AAAAAAAAAAA') ? 'Private video' : null });
+    const h = await setup(t, { cacheSpawn: tools.spawn });
+    h.queues.set('alice', ['A', 'B'].map(id => ({ id, media: 'https://youtu.be/' + id.repeat(11), username: 'viewer' })));
+    await assert.rejects(h.youtubeVideoCache.prepare('AAAAAAAAAAA'), { code: 'YOUTUBE_UNAVAILABLE' });
+    const ui = frontend(h, 'overlay.js', undefined, { info: async url => new Response(JSON.stringify(url.includes('AAAAAAAAAAA')
+        ? { status: 'failed', code: 'YOUTUBE_UNAVAILABLE', error: 'Private video' }
+        : { status: 'ready', duration: 180 }), { status: url.includes('AAAAAAAAAAA') ? 502 : 200 }) });
+    await ui.ready;
+    await until(() => ui.plays.length === 1);
+    assert.equal(ui.plays[0], '/api/yt-video/BBBBBBBBBBB');
+    assert.equal(ui.audios[0].hidden, false);
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
+});
+
+test('an all-private looping personal list becomes idle after one verified skip instead of looping forever', async t => {
+    const tools = require('./helpers/media-tools').createMediaTools({ downloadFailure: 'Private video' });
+    const h = await setup(t, { cacheSpawn: tools.spawn });
+    await h.add('AAAAAAAAAAA');
+    await h.add('AAAAAAAAAAA');
+    await h.api('/api/mode/alice', 'POST', { mylistLoop: true });
+    await assert.rejects(h.youtubeCache.prepare('AAAAAAAAAAA'), { code: 'YOUTUBE_UNAVAILABLE' });
+    const ui = frontend(h, 'overlay.js', undefined, { info: async () => new Response(JSON.stringify({
+        status: 'failed', code: 'YOUTUBE_UNAVAILABLE', error: 'Private video' }), { status: 502 }) });
+    await ui.ready;
+    await until(() => h.calls.some(call => call.action === 'removemedia') && ui.run('currentItemId') === null);
+    assert.equal(ui.plays.length, 0);
+    assert.equal(ui.audios[0].hidden, true);
+    assert.equal((await h.api('/api/mylist/alice')).data.items.length, 0);
     assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
 });

@@ -39,7 +39,8 @@ async function createTestServer(options = {}) {
             if (name === 'dotenv') return { config() {} };
             if (name === './youtube-cache') return {
                 createYouTubeCache: settings => serverRequire(name).createYouTubeCache({ ...settings,
-                    root: path.join(localRoot, '.youtube-cache'), spawn: options.cacheSpawn || cacheTools.spawn })
+                    root: path.join(localRoot, settings.mediaType === 'video' ? '.youtube-video-cache' : '.youtube-cache'),
+                    spawn: options.cacheSpawn || cacheTools.spawn })
             };
             if (name === 'child_process' && (options.spawn || options.execFile))
                 return { ...serverRequire(name),
@@ -101,8 +102,8 @@ async function createTestServer(options = {}) {
             return { ok: true, json: async () => ({ success: true }) };
         }
     };
-    const { playlistImporter, sessionStore, io, youtubeCache } = vm.runInNewContext(
-        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter, sessionStore, io, youtubeCache });', sandbox, { filename: serverFile });
+    const { playlistImporter, sessionStore, io, youtubeCache, youtubeVideoCache, musicLibrary } = vm.runInNewContext(
+        fs.readFileSync(serverFile, 'utf8') + '\n({ playlistImporter, sessionStore, io, youtubeCache, youtubeVideoCache, musicLibrary });', sandbox, { filename: serverFile });
     server.listen = listen;
     await new Promise(resolve => listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
@@ -122,7 +123,7 @@ async function createTestServer(options = {}) {
     }
 
     return {
-        base, calls, events, queues, request, login, localRoot, accounts, sessionStore, youtubeCache, cacheTools,
+        base, calls, events, queues, request, login, localRoot, accounts, sessionStore, youtubeCache, youtubeVideoCache, cacheTools, musicLibrary,
         settleImport(channel = 'alice') { return playlistImporter.settle(channel); },
         failPromotion(kind) { failPromotion = kind; },
         beforePromotion(action) { beforePromotion = action; },
@@ -135,6 +136,7 @@ async function createTestServer(options = {}) {
                 await playlistImporter.settle(channel);
             }
             await youtubeCache.close();
+            await youtubeVideoCache.close();
             server.closeAllConnections();
             if (options.realSockets) await new Promise(resolve => io.close(resolve));
             else await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));

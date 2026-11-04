@@ -105,7 +105,7 @@ test('current prepares the next three songs without consuming, rotating or editi
     const before = JSON.stringify(queue);
     const current = await h.request('/api/channels/alice/current');
     assert.equal(current.status, 200);
-    await until(() => 'ABCD'.split('').every(id => h.youtubeCache.status(id.repeat(11)).status === 'ready'));
+    await until(() => 'ABCD'.split('').every(id => h.youtubeVideoCache.status(id.repeat(11)).status === 'ready'));
     const urls = tools.calls.filter(call => call.command === 'yt-dlp').map(call => call.args.at(-1));
     assert.deepEqual(urls, 'ABCD'.split('').map(id => 'https://www.youtube.com/watch?v=' + id.repeat(11)));
     assert.equal(JSON.stringify(queue), before);

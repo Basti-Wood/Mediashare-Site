@@ -36,9 +36,11 @@ function createMediaTools(options = {}) {
                     fs.writeFileSync(template.replace('%(ext)s', args.includes('bestaudio[ext=m4a]/bestaudio/best') ? 'm4a' : 'mp4'),
                         Buffer.alloc(options.sourceBytes || 20, 1));
                 } else if (command === 'ffprobe') {
-                    const normalized = args.at(-1).endsWith('ready.mp3');
+                    const normalized = /ready\.(mp3|mp4)$/.test(args.at(-1));
+                    const mp3 = args.at(-1).endsWith('.mp3');
                     child.stdout.write(JSON.stringify({ format: { duration: options.truncated && normalized ? 5 : options.duration || 30 },
-                        streams: options.noAudio ? [] : [{ codec_type: 'audio', codec_name: normalized ? 'mp3' : 'aac' }] }));
+                        streams: [...(options.noAudio ? [] : [{ codec_type: 'audio', codec_name: mp3 ? 'mp3' : 'aac' }]),
+                            ...(mp3 || options.noVideo ? [] : [{ codec_type: 'video', codec_name: 'h264' }])] }));
                 } else if (command === 'ffmpeg') {
                     if (options.convertFailure || (options.decodeFailure && args.at(-1) === '-')) {
                         child.stderr.write('Invalid data in audio file'); return close(1);

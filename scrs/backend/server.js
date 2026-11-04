@@ -689,7 +689,7 @@ async function promoteMyListHeadToBasti(ch) {
     }
 }
 
-// Download and validate complete audio before playback; upcoming tracks share
+// Download and validate complete media before playback; upcoming tracks share
 // this bounded disk cache. No signed YouTube URL is passed to the browser.
 const LOUDNORM_FILTER = 'loudnorm=I=-14:TP=-1.5:LRA=11';
 function cacheSetting(name, fallback, min, max) {
@@ -708,56 +708,70 @@ const youtubeCache = createYouTubeCache({
     loudnorm: LOUDNORM_FILTER,
     onError: (id, err) => console.error(`YouTube preparation ${id}: ${err.code}: ${err.message}`)
 });
-function validYouTubeAudioId(req, res) {
+const youtubeVideoCacheMB = cacheSetting('YOUTUBE_VIDEO_CACHE_MAX_MB', 1024, 16, 10240);
+const youtubeVideoCache = createYouTubeCache({
+    root: process.env.YOUTUBE_VIDEO_CACHE_ROOT || path.join(__dirname, '../..', 'data', 'youtube-video-cache'),
+    mediaType: 'video',
+    maxBytes: youtubeVideoCacheMB * 1024 * 1024,
+    maxEntryBytes: Math.min(youtubeVideoCacheMB, cacheSetting('YOUTUBE_VIDEO_CACHE_ENTRY_MB', 256, 1, 1024)) * 1024 * 1024,
+    ttlMs: cacheSetting('YOUTUBE_CACHE_TTL_HOURS', 6, 0.1, 168) * 60 * 60 * 1000,
+    downloadTimeoutMs: cacheSetting('YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS', 180, 10, 900) * 1000,
+    loudnorm: LOUDNORM_FILTER,
+    onError: (id, err) => console.error(`YouTube video preparation ${id}: ${err.code}: ${err.message}`)
+});
+const youtubeMediaCaches = { audio: youtubeCache, video: youtubeVideoCache };
+function validYouTubeMediaId(req, res) {
     if (/^[A-Za-z0-9_-]{11}$/.test(req.params.videoId || '')) return true;
     res.status(400).json({ error: 'Invalid video id.' });
     return false;
 }
 function youtubePreparationError(res, err) {
     if (res.destroyed || res.headersSent) return;
-    res.status(err.status || 502).json({ status: 'failed', error: err.status ? err.message : 'Could not prepare YouTube audio.',
+    res.status(err.status || 502).json({ status: 'failed', error: err.status ? err.message : 'Could not prepare YouTube media.',
         code: err.code || 'PREPARATION_FAILED' });
 }
 
 // Preparation is asynchronous so reverse proxies and browser media timeouts do
 // not abort a long first download. The overlay polls until the file is ready.
-app.get('/api/yt-audio/:videoId/info', (req, res) => {
-    res.setHeader('Cache-Control', 'no-store');
-    if (!validYouTubeAudioId(req, res)) return;
-    try {
-        const state = youtubeCache.request(req.params.videoId, { retry: req.query.retry === '1' });
-        if (state.status === 'preparing') {
-            res.setHeader('Retry-After', '1');
-            return res.status(202).json(state);
-        }
-        const { httpStatus, ...body } = state;
-        res.status(httpStatus || 200).json(body);
-    } catch (err) { youtubePreparationError(res, err); }
-});
+for (const [mediaType, cache] of Object.entries(youtubeMediaCaches)) {
+    app.get(`/api/yt-${mediaType}/:videoId/info`, (req, res) => {
+        res.setHeader('Cache-Control', 'no-store');
+        if (!validYouTubeMediaId(req, res)) return;
+        try {
+            const state = cache.request(req.params.videoId, { retry: req.query.retry === '1' });
+            if (state.status === 'preparing') {
+                res.setHeader('Retry-After', '1');
+                return res.status(202).json(state);
+            }
+            const { httpStatus, ...body } = state;
+            res.status(httpStatus || 200).json(body);
+        } catch (err) { youtubePreparationError(res, err); }
+    });
 
-// Only completed, checked, same-origin MP3s are served. sendFile supplies byte
-// ranges and Content-Length for seeking and reliable completion detection.
-app.get('/api/yt-audio/:videoId', async (req, res) => {
-    res.setHeader('Cache-Control', 'no-store');
-    if (!validYouTubeAudioId(req, res)) return;
-    let lease;
-    try {
-        lease = youtubeCache.acquire(req.params.videoId);
-        res.once('finish', lease.release);
-        res.once('close', lease.release);
-        const entry = await lease.ready;
-        if (res.destroyed) return;
-        res.type('audio/mpeg');
-        res.sendFile(entry.file, { dotfiles: 'allow' }, err => {
-            if (!err) return;
-            if (res.headersSent) res.destroy(err);
-            else youtubePreparationError(res, err);
-        });
-    } catch (err) {
-        lease?.release();
-        youtubePreparationError(res, err);
-    }
-});
+    // Only completed, checked, same-origin MP3/MP4 files are served. sendFile supplies byte
+    // ranges and Content-Length for seeking and reliable completion detection.
+    app.get(`/api/yt-${mediaType}/:videoId`, async (req, res) => {
+        res.setHeader('Cache-Control', 'no-store');
+        if (!validYouTubeMediaId(req, res)) return;
+        let lease;
+        try {
+            lease = cache.acquire(req.params.videoId);
+            res.once('finish', lease.release);
+            res.once('close', lease.release);
+            const entry = await lease.ready;
+            if (res.destroyed) return;
+            res.type(mediaType === 'video' ? 'video/mp4' : 'audio/mpeg');
+            res.sendFile(entry.file, { dotfiles: 'allow' }, err => {
+                if (!err) return;
+                if (res.headersSent) res.destroy(err);
+                else youtubePreparationError(res, err);
+            });
+        } catch (err) {
+            lease?.release();
+            youtubePreparationError(res, err);
+        }
+    });
+}
 
 // ── Overlay endpoints (no auth — used by OBS browser source) ─────────────────
 
@@ -838,8 +852,11 @@ app.get('/api/channels/:ch/current', async (req, res) => {
             // consume queue entries. Local uploads already have their own files.
             const upcoming = upcomingMedia({ queue: media, personal: getMyList(ch), mode: modeData,
                 isOwner: item => isOwnerSong(item, ch), count: YOUTUBE_PREFETCH_COUNT });
-            youtubeCache.plan(ch, parseYouTubeVideoId(current?.url || current?.media || ''),
-                upcoming.map(item => parseYouTubeVideoId(item.url || item.media || '')).filter(Boolean));
+            for (const [type, cache] of Object.entries(youtubeMediaCaches)) {
+                const matches = item => item && (item._source === 'requests' ? 'video' : 'audio') === type;
+                cache.plan(ch, matches(current) ? parseYouTubeVideoId(current.url || current.media || '') : null,
+                    upcoming.filter(matches).map(item => parseYouTubeVideoId(item.url || item.media || '')).filter(Boolean));
+            }
             res.json({ current });
         } catch (e) {
             console.error('current failed:', e.message || e);
@@ -852,19 +869,41 @@ app.get('/api/channels/:ch/current', async (req, res) => {
 // Everything (owner songs included) now lives in the Basti queue, so advancing
 // is simply removing index 0 from Basti. In 'switch' mode we flip whose turn is
 // next so the following /current call promotes a My List song (or not).
-async function advancePlayback(ch, playbackId, onlyIfPlaying = false) {
+async function advancePlayback(ch, playbackId, onlyIfPlaying = false, unavailable = null) {
     return withPlaybackLock(ch, async () => {
         if (playbackId && playbackId !== playbackByChannel.get(ch)?.id)
             return { success: true, advanced: false };
-        if (onlyIfPlaying) {
+        if (unavailable && (!playbackId || !Object.hasOwn(youtubeMediaCaches, unavailable.mediaType)
+            || !/^[A-Za-z0-9_-]{11}$/.test(unavailable.videoId || '')))
+            return { success: true, advanced: false };
+        if (onlyIfPlaying || unavailable) {
             const current = await bastiGet(`/getallmedia/${encodeURIComponent(ch)}`);
             if (!Array.isArray(current.media) || !current.media.length)
                 return { success: true, advanced: false };
+            if (unavailable) {
+                const item = current.media[0];
+                const type = isOwnerSong(item, ch) ? 'audio' : 'video';
+                const failure = youtubeMediaCaches[type].status(unavailable.videoId);
+                if (type !== unavailable.mediaType || parseYouTubeVideoId(item.url || item.media || '') !== unavailable.videoId
+                    || failure.status !== 'failed' || failure.code !== 'YOUTUBE_UNAVAILABLE')
+                    return { success: true, advanced: false };
+            }
         }
         await bastiPost(`/removemedia/${encodeURIComponent(ch)}/0`);
+        const playing = promotedMyListByChannel.get(ch);
+        // Invalidate the consumed playback before any subsequent disk write.
+        // Even a save failure must not let another player remove its successor.
         personalListWaitByChannel.delete(ch);
         playbackByChannel.delete(ch);
         promotedMyListByChannel.delete(ch);
+        if (unavailable) {
+            // Retire confirmed unavailable tracks from the active personal list,
+            // including loop duplicates. Saved playlist snapshots stay intact.
+            if (playing) retiredMyListSongs.add(playing);
+            const data = loadChannelMyList(ch);
+            data.items = data.items.filter(item => parseYouTubeVideoId(item.url || item.media || '') !== unavailable.videoId);
+            saveChannelMyList(ch, data);
+        }
         const modeData = loadChannelMode(ch);
         if (modeData.mode === 'switch') {
             modeData.switchTurn = modeData.switchTurn === 'mylist' ? 'requests' : 'mylist';
@@ -876,7 +915,7 @@ async function advancePlayback(ch, playbackId, onlyIfPlaying = false) {
 }
 
 app.post('/api/channels/:ch/next', async (req, res) => {
-    try { res.json(await advancePlayback(req.params.ch, req.body.playbackId)); }
+    try { res.json(await advancePlayback(req.params.ch, req.body.playbackId, false, req.body.unavailable || null)); }
     catch { res.status(502).json({ error: 'Could not reach api.bastiwood.com' }); }
 });
 
