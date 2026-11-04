@@ -22,6 +22,7 @@ function frontend(h, file, cookie, options = {}) {
     const documentHandlers = new Map();
     const socketHandlers = new Map();
     const timers = new Map();
+    const opened = [];
     let timerSerial = 0;
     function element(id) {
         if (!elements.has(id)) elements.set(id, {
@@ -54,6 +55,8 @@ function frontend(h, file, cookie, options = {}) {
     const context = vm.createContext({
         document: { getElementById: element, addEventListener(event, handler) { documentHandlers.set(event, handler); }, visibilityState: 'visible', hidden: false },
         window: { location: { origin: h.base, search: options.search || '?channel=alice&controls=1', href: '' },
+            name: options.windowName || '',
+            open(...args) { opened.push(args); },
             addEventListener(event, handler) { windowHandlers.set(event, handler); },
             ...(options.audioContext === false ? {} : { AudioContext: class {
                 constructor() { this.state = options.suspended ? 'suspended' : 'running'; this.currentTime = 0; this.destination = {}; outputs.push(this); }
@@ -63,6 +66,7 @@ function frontend(h, file, cookie, options = {}) {
                 resume() { if (!options.blockResume) this.state = 'running'; return Promise.resolve(); }
             } }) },
         navigator: {}, URLSearchParams, FormData, Blob,
+        ...(options.now ? { Date: class extends Date { static now() { return options.now(); } } } : {}),
         console: { log() {}, warn() {}, error: (...args) => errors.push(args) },
         setTimeout(callback, delay) { const id = ++timerSerial; timers.set(id, { callback, delay }); return id; },
         clearTimeout(id) { timers.delete(id); }, setInterval() { return 1; }, clearInterval() {},
@@ -73,7 +77,7 @@ function frontend(h, file, cookie, options = {}) {
     });
     const source = fs.readFileSync(path.resolve(__dirname, '../scrs/frontend', file), 'utf8');
     const ready = vm.runInContext(source, context, { filename: file });
-    return { context, elements, errors, audios, plays, outputs, windowHandlers, documentHandlers, ready,
+    return { context, elements, errors, audios, plays, outputs, windowHandlers, documentHandlers, ready, opened,
         runTimer(delay) {
             const next = [...timers].find(([, timer]) => timer.delay === delay);
             if (!next) throw new Error('No timer for ' + delay);
@@ -831,4 +835,154 @@ test('an all-private looping personal list becomes idle after one verified skip 
     assert.equal(ui.audios[0].hidden, true);
     assert.equal((await h.api('/api/mylist/alice')).data.items.length, 0);
     assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 1);
+});
+
+test('late silent pop-out and OBS join the main position; pause, seek and resume stay synchronized', async t => {
+    let time = 100000;
+    const h = await setup(t, { now: () => time });
+    h.queues.set('alice', [{ id: 'request-a', media: 'https://youtu.be/AAAAAAAAAAA', username: 'viewer' }]);
+    const main = frontend(h, 'overlay.js', h.cookie, { now: () => time });
+    await main.ready;
+    await main.run("syncPlayback('playing')");
+    assert.equal(h.playbackClock.snapshot('alice').started, true);
+    time += 45000;
+    main.audios[0].currentTime = 45;
+    await main.run("syncPlayback('playing')");
+    const mirror = frontend(h, 'overlay.js', undefined, { search: '?channel=alice&videoOnly=1&controls=1', now: () => time + 20000 });
+    await mirror.ready;
+    assert.equal(mirror.run('CONTROLS'), false);
+    assert.equal(mirror.audios[0].currentTime, 45);
+    assert.equal(mirror.audios[0].muted, true);
+    assert.equal(mirror.audios[0].volume, 0);
+    assert.equal(mirror.audios[0].defaultMuted, true);
+    assert.equal(mirror.outputs.length, 0);
+    assert.equal(mirror.plays.length, 1);
+    const publish = () => {
+        const state = h.playbackClock.snapshot('alice');
+        main.emitSocket('playback:sync', state);
+        mirror.emitSocket('playback:sync', state);
+    };
+    await h.api('/api/channels/alice/audio-settings', 'POST', { paused: true });
+    publish();
+    assert.equal(main.audios[0].paused, true);
+    assert.equal(mirror.audios[0].paused, true);
+    time += 10000;
+    await mirror.run('syncPlayback()');
+    assert.equal(mirror.audios[0].currentTime, 45);
+    main.elements.get('seek-bar').value = 50;
+    await main.elements.get('seek-bar').fire('change');
+    publish();
+    assert.equal(main.audios[0].currentTime, 90);
+    assert.equal(mirror.audios[0].currentTime, 90);
+    assert.equal(mirror.audios[0].paused, true);
+    await h.api('/api/channels/alice/audio-settings', 'POST', { paused: false, volume: 100 });
+    publish();
+    await main.run("syncPlayback('playing')");
+    assert.equal(mirror.audios[0].paused, false);
+    assert.equal(mirror.audios[0].muted, true);
+    assert.equal(mirror.audios[0].volume, 0);
+    mirror.audios[0].currentTime = 80;
+    await mirror.run('syncPlayback()');
+    assert.equal(mirror.audios[0].currentTime, 90);
+    const obs = frontend(h, 'overlay.js', undefined, { search: '?channel=alice', now: () => time - 30000 });
+    await obs.ready;
+    assert.equal(obs.audios[0].currentTime, 90);
+    assert.equal(obs.outputs.length, 1);
+    mirror.audios[0].handlers.get('ended')();
+    await mirror.run('advance()');
+    assert.equal(h.calls.filter(call => call.action === 'removemedia').length, 0);
+    assert.equal(mirror.outputs.length, 0);
+});
+
+test('a silent observer waits for actual playback and never starts audio or promotes a personal song', async t => {
+    let time = 100000;
+    const h = await setup(t, { now: () => time });
+    await h.add('AAAAAAAAAAA');
+    const personalMirror = frontend(h, 'overlay.js', undefined, { search: '?channel=alice&videoOnly=1', now: () => time });
+    await personalMirror.ready;
+    assert.equal(personalMirror.audios[0].src, '');
+    assert.equal(personalMirror.plays.length, 0);
+    assert.equal(h.calls.filter(call => call.action === 'setmediatop').length, 0);
+    h.queues.set('alice', [{ id: 'request-b', media: 'https://youtu.be/BBBBBBBBBBB', username: 'viewer' }]);
+    const mirror = frontend(h, 'overlay.js', undefined, { search: '?channel=alice&videoOnly=1', now: () => time });
+    await mirror.ready;
+    assert.equal(mirror.audios[0].src, '/api/yt-video/BBBBBBBBBBB');
+    assert.equal(mirror.plays.length, 0);
+    const state = h.playbackClock.snapshot('alice');
+    h.playbackClock.report('alice', { playbackId: state.playbackId, clientId: 'main_player', position: 12,
+        duration: 180, state: 'playing', seekVersion: 0, settingsRevision: 0 });
+    await mirror.run('syncPlayback()');
+    assert.equal(mirror.audios[0].currentTime, 12);
+    assert.equal(mirror.plays.length, 1);
+    mirror.audios[0].muted = false;
+    mirror.audios[0].volume = 1;
+    mirror.audios[0].handlers.get('volumechange')();
+    assert.equal(mirror.audios[0].muted, true);
+    assert.equal(mirror.audios[0].volume, 0);
+    assert.equal(mirror.outputs.length, 0);
+});
+
+test('the dashboard pop-out button opens a silent synchronized video without player controls', async t => {
+    const h = await setup(t);
+    const ui = frontend(h, 'main.js', h.cookie);
+    await ui.ready;
+    await ui.elements.get('popout-btn').fire('click');
+    const url = new URL(ui.opened[0][0]);
+    assert.equal(url.searchParams.get('channel'), 'alice');
+    assert.equal(url.searchParams.get('videoOnly'), '1');
+    assert.equal(url.searchParams.has('controls'), false);
+});
+
+test('a suspended audio output cannot start the shared clock before sound is permitted', async t => {
+    const h = await setup(t);
+    h.queues.set('alice', [{ id: 'request-a', media: 'https://youtu.be/AAAAAAAAAAA', username: 'viewer' }]);
+    const ui = frontend(h, 'overlay.js', h.cookie, { suspended: true, blockResume: true });
+    await ui.ready;
+    await ui.run('syncPlayback()');
+    assert.equal(h.playbackClock.snapshot('alice').started, false);
+    ui.outputs[0].state = 'running';
+    await ui.elements.get('playback-retry-btn').fire('click');
+    await ui.run("syncPlayback('playing')");
+    assert.equal(h.playbackClock.snapshot('alice').started, true);
+});
+
+test('a shared seek supersedes an in-flight buffering report without rewinding the next clock update', async t => {
+    let time = 100000;
+    const h = await setup(t, { now: () => time });
+    h.queues.set('alice', [{ id: 'request-a', media: 'https://youtu.be/AAAAAAAAAAA', username: 'viewer' }]);
+    const ui = frontend(h, 'overlay.js', h.cookie, { now: () => time });
+    await ui.ready;
+    await ui.run("syncPlayback('playing')");
+    await until(() => ui.run('clockRequest') === null);
+    const original = ui.context.fetch;
+    let release, held = false, hold = true;
+    ui.context.fetch = async (url, options) => {
+        const res = await original(url, options);
+        if (hold && url.endsWith('/playback/report')) {
+            hold = false; held = true;
+            await new Promise(resolve => { release = resolve; });
+        }
+        return res;
+    };
+    ui.audios[0].currentTime = 15;
+    ui.audios[0].handlers.get('waiting')();
+    await until(() => held);
+    ui.elements.get('seek-bar').value = 50;
+    await ui.elements.get('seek-bar').fire('change');
+    ui.audios[0].handlers.get('playing')();
+    release();
+    await until(() => h.playbackClock.snapshot('alice').running && h.playbackClock.snapshot('alice').seekVersion === 1 && ui.run('clockRequest') === null);
+    assert.equal(h.playbackClock.snapshot('alice').position, 90);
+    assert.equal(ui.audios[0].currentTime, 90);
+});
+
+test('reloading an existing named pop-out also becomes video-only with its old controls URL', async t => {
+    const h = await setup(t);
+    h.queues.set('alice', [{ id: 'request-a', media: 'https://youtu.be/AAAAAAAAAAA', username: 'viewer' }]);
+    const ui = frontend(h, 'overlay.js', undefined, { windowName: 'mediashare_player' });
+    await ui.ready;
+    assert.equal(ui.run('VIDEO_ONLY'), true);
+    assert.equal(ui.run('CONTROLS'), false);
+    assert.equal(ui.audios[0].muted, true);
+    assert.equal(ui.outputs.length, 0);
 });

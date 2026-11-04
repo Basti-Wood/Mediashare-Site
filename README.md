@@ -98,7 +98,7 @@ known filename for the current song.
 Metadata lookup and temporary YouTube downloads use `yt-dlp`; `ffmpeg` normalizes
 uploaded MP3s and prepared audio. `ffprobe` checks the downloaded and normalized
 files. The Docker image includes these tools and Node 24. Refresh the dashboard and OBS browser source after updating; both
-scripts are versioned `request-video-1`.
+scripts are versioned `sync-player-1`.
 
 ## Playback errors and unavailable videos
 
@@ -127,10 +127,13 @@ first, with a combined MP4 source as a fallback for extracting audio. Files stay
 on the server rather than downloading to your computer. Dashboard and OBS share
 completed files and download jobs within each cache.
 
-While the current song plays, the server prepares the next **three tracks** in
-queue order, including alternating mode, Loop and Play next uploads. Viewer
-requests warm the video cache; personal songs warm the audio cache; local MP3s
-already have files. This never consumes or reorders songs. The player shows
+Viewer-requested videos have download priority. The server warms the next **three
+viewer requests** even during My List mode. Viewer work interrupts a running
+personal-list prefetch, which waits and resumes when the viewer files are ready.
+The current personal song can still finish preparing so audio playback is not
+blocked. This priority changes downloads, not the selected playback mode or queue
+order. Personal lookahead follows the next three actual tracks, including Loop,
+alternating mode and Play next uploads. Local MP3s already have files. The player shows
 **Downloading** or **Preparing** until its complete file is ready. Its first
 song can take time to prepare; later cached songs start promptly.
 
@@ -151,6 +154,28 @@ and `YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS` in the container environment. Live stream
 oversized videos and temporary server-wide YouTube blocks still show Retry/Skip.
 Rebuild Docker with `--no-cache` to refresh yt-dlp when YouTube changes.
 
+## Synchronized players and silent video pop-out
+
+The dashboard, pop-out and OBS follow one channel playback clock. Opening a
+player after a video has started joins its current position instead of starting
+at zero. A signed-in seek, Pause/Resume and buffering updates are shared. Socket
+updates and a lightweight two-second clock refresh correct drift and reconnects.
+The clock starts when an audible player actually begins playback, so preparation
+time does not count as played time. It resets for a new playback and on server
+restart. One audible player reports the position; another can take over within
+about six seconds if that player disconnects.
+
+**Video pop-out** opens a silent picture-only follower with no player controls.
+It stays muted before the video loads, creates no audio output and never advances
+the queue. It waits for main/OBS playback to start and shows only requested videos;
+personal music leaves the pop-out blank. Keep the dashboard player or an audible
+OBS source running to drive playback.
+
+The copied **OBS Source URL** still includes audio. For a silent OBS display when
+you already capture audio elsewhere, append `&videoOnly=1` to that URL. A normal
+OBS source joins the same current position and can drive playback when the main
+page is closed. Refresh existing sources after updating to load `sync-player-1`.
+
 ## Saved volume and shared Pause/Resume
 
 Volume and paused state are saved for each user's channel and restored before
@@ -168,7 +193,7 @@ saves: a pending volume save does not discard Pause, and older acknowledgements
 cannot overwrite newer settings. Song duration comes from cached audio metadata,
 without loading the YouTube iframe API.
 
-Change settings from a signed-in dashboard or pop-out. OBS can read and follow
+Change settings from a signed-in dashboard or a player opened with `controls=1`. OBS can read and follow
 the saved settings without logging in. Each channel's preferences are separate;
 moderators with access to a channel can adjust that channel's audio. Settings
 live in `./data/audio-settings` under the same persistent data mount as MP3s.
@@ -176,7 +201,7 @@ live in `./data/audio-settings` under the same persistent data mount as MP3s.
 If the Local Music playlist form is missing, verify that the feature pull request
 has been merged and that your deployment has pulled that revision. Refresh the
 dashboard and OBS browser source after updating. The updated overlay script is
-versioned `request-video-1`.
+versioned `sync-player-1`.
 
 ## Update an existing Docker installation
 

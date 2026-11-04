@@ -11,7 +11,9 @@ function getSpotifyInfo(url) {
 
 const params = new URLSearchParams(window.location.search);
 const CHANNEL = (params.get('channel') || '').trim();
-const CONTROLS = params.get('controls') === '1';
+const VIDEO_ONLY = params.get('videoOnly') === '1' || window.name === 'mediashare_player';
+const CONTROLS = !VIDEO_ONLY && params.get('controls') === '1';
+const playerId = globalThis.crypto?.randomUUID?.() || `player_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
 let volumePercent = 100;
 let audioPaused = false;
 let playbackMode = null;
@@ -29,6 +31,12 @@ let isSeeking = false;
 let preparationSequence = 0;
 let preparationTimer = null;
 let preparingYouTube = false;
+let playbackState = null;
+let serverTimeOffset = null;
+let clockRequest = null;
+let mediaBuffering = false;
+let pendingClockSeek = false;
+let appliedSeekVersion = -1;
 
 const idleScreen = document.getElementById('idle-screen');
 const audioCard = document.getElementById('audio-card');
@@ -50,9 +58,12 @@ const timeDisplay = CONTROLS ? document.getElementById('time-display') : null;
 const audioEl = document.getElementById('media-player');
 audioEl.preload = 'auto';
 audioEl.autoplay = false;
+audioEl.defaultMuted = VIDEO_ONLY;
+audioEl.muted = VIDEO_ONLY;
 let audioOutput = null;
 
 function ensureAudioOutput() {
+    if (VIDEO_ONLY) return null;
     if (audioOutput) return audioOutput.context;
     const AudioContextType = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextType) return null;
@@ -76,7 +87,8 @@ function applyVolume(value = volumePercent) {
     if (volumeInput && (volumeInput.value === '' || Number(String(volumeInput.value).replace(',', '.')) !== volumePercent))
         volumeInput.value = volumePercent;
     const level = volumePercent / 100;
-    if (audioOutput) {
+    if (VIDEO_ONLY) audioEl.volume = 0;
+    else if (audioOutput) {
         audioEl.volume = 1;
         const { context, gain } = audioOutput;
         const currentGain = gain.gain.value;
@@ -86,12 +98,12 @@ function applyVolume(value = volumePercent) {
         // 0.5% = 0.005, half the signal gain at 1% = 0.01.
         gain.gain.linearRampToValueAtTime(level, context.currentTime + 0.005);
     } else audioEl.volume = level;
-    audioEl.muted = level === 0;
+    audioEl.muted = VIDEO_ONLY || level === 0;
     return true;
 }
 
 function showPlaybackMessage(message, error = false, preparing = false) {
-    playbackStatus.hidden = !message || (!error && !CONTROLS);
+    playbackStatus.hidden = VIDEO_ONLY || !message || (!error && !CONTROLS);
     playbackMessage.textContent = message;
     playbackRetryBtn.hidden = preparing;
 }
@@ -99,12 +111,19 @@ function usesNativeAudio() { return playbackMode === 'youtube-audio' || playback
 function nativeAudioFailed() {
     if (!currentMediaItem || !usesNativeAudio()) return;
     stopAudio();
+    if (VIDEO_ONLY) {
+        currentItemId = null;
+        preparationTimer = setTimeout(fetchAndPlay, 1000);
+        return;
+    }
     showPlaybackMessage(playbackMode.startsWith('youtube-')
         ? `YouTube ${playbackMode === 'youtube-video' ? 'video' : 'audio'} could not be loaded. Retry playback or skip this song.`
         : 'This MP3 could not be loaded. Retry playback or skip this song.', true);
 }
 function startNativeAudio() {
     if (!audioEl.src || preparingYouTube) return;
+    if (pendingClockSeek) return;
+    if (VIDEO_ONLY && (!playbackState?.running || !playbackState.started)) { audioEl.pause(); return; }
     if (audioPaused) { audioEl.pause(); return; }
     const requestedId = currentItemId;
     const stillCurrent = () => requestedId === currentItemId && usesNativeAudio();
@@ -123,8 +142,103 @@ function startNativeAudio() {
             }).catch(err => { if (stillCurrent()) showPlaybackMessage('Click Play / Retry to allow audio playback.', true); });
         }
         const pending = audioEl.play();
-        if (pending?.catch) pending.catch(failed);
+        if (pending?.then) pending.then(() => {
+            if (stillCurrent() && !audioPaused && (!audioOutput || audioOutput.context.state === 'running')) reportPlayback('playing');
+        }).catch(failed);
     } catch (err) { failed(err); }
+}
+
+function clockPosition() {
+    if (!playbackState) return 0;
+    const elapsed = playbackState.running ? Math.max(0, Date.now() + (serverTimeOffset || 0) - playbackState.serverNow) / 1000 : 0;
+    const duration = getPlaybackDuration() || playbackState.duration;
+    return Math.max(0, Math.min(duration || Infinity, playbackState.position + elapsed));
+}
+function followPlaybackClock(force = false, resume = true) {
+    if (!playbackState || playbackState.playbackId !== currentItemId || !usesNativeAudio() || !audioEl.src) return;
+    const seekChanged = appliedSeekVersion !== playbackState.seekVersion;
+    const leader = playbackState.leaderId === playerId;
+    const delta = clockPosition() - (audioEl.currentTime || 0);
+    const jumped = force || seekChanged || (!leader && Math.abs(delta) > 0.35);
+    if (jumped) {
+        try { audioEl.currentTime = clockPosition(); pendingClockSeek = false; }
+        catch { pendingClockSeek = true; }
+    }
+    if (!pendingClockSeek) appliedSeekVersion = playbackState.seekVersion;
+    // Small drift is corrected gently; larger drift and shared seeks jump to
+    // the common position. The audible leader follows its actual media clock.
+    audioEl.playbackRate = !jumped && !leader && Math.abs(delta) > 0.08 && Math.abs(delta) <= 0.35
+        ? 1 + Math.max(-0.04, Math.min(0.04, delta * 0.12)) : 1;
+    if (audioPaused || (VIDEO_ONLY && !playbackState.started)) { audioEl.pause(); return; }
+    if (!playbackState.running && playbackState.started && !leader
+        && (VIDEO_ONLY || playbackState.leaseUntil > Date.now() + (serverTimeOffset || 0))) {
+        audioEl.pause(); return;
+    }
+    if (resume && audioEl.paused && !preparingYouTube && !pendingClockSeek) startNativeAudio();
+}
+function acceptPlaybackState(state, sentAt, receivedAt = Date.now()) {
+    if (!state || state.playbackId !== currentItemId || !Number.isFinite(state.position)
+        || !Number.isFinite(state.serverNow) || !Number.isFinite(state.revision)) return;
+    if (playbackState && (state.revision < playbackState.revision
+        || (state.revision === playbackState.revision && state.serverNow < playbackState.serverNow))) return;
+    if (sentAt !== undefined) serverTimeOffset = state.serverNow - (sentAt + receivedAt) / 2;
+    else if (serverTimeOffset === null) serverTimeOffset = state.serverNow - receivedAt;
+    playbackState = state;
+    acceptAudioSettings({ paused: state.paused }, state.settingsRevision);
+    followPlaybackClock();
+}
+function syncPlayback(stateOverride) {
+    if (!CHANNEL || !currentItemId || advancing) return Promise.resolve();
+    const id = currentItemId;
+    if (clockRequest?.id === id) {
+        if (stateOverride) clockRequest.pending = stateOverride;
+        return clockRequest.promise;
+    }
+    const request = { id, promise: null };
+    clockRequest = request;
+    const sentAt = Date.now();
+    const reporting = !VIDEO_ONLY && usesNativeAudio() && audioEl.src && !preparingYouTube
+        && (!audioOutput || audioOutput.context.state === 'running');
+    const body = reporting ? { playbackId: id, clientId: playerId, position: audioEl.currentTime || 0,
+        duration: getPlaybackDuration() || 0, state: stateOverride || (audioEl.paused ? 'paused' : mediaBuffering ? 'waiting' : 'playing'),
+        seekVersion: playbackState?.seekVersion || 0, settingsRevision: serverAudioRevision,
+        reportedAt: sentAt + (serverTimeOffset || 0) } : null;
+    request.promise = (async () => {
+        try {
+            const res = await fetch(`/api/channels/${encodeURIComponent(CHANNEL)}/playback${reporting ? '/report' : ''}`,
+                reporting ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : { cache: 'no-store' });
+            if (!res.ok) return;
+            const data = await res.json();
+            if (id !== currentItemId || advancing) return;
+            if (data.playback && data.playback.playbackId !== id) { fetchAndPlay(); return; }
+            acceptPlaybackState(data.playback, sentAt);
+        } catch { /* A disconnected player keeps running and rejoins on reconnect. */ }
+        finally {
+            if (clockRequest === request) {
+                clockRequest = null;
+                if (request.pending && id === currentItemId && !advancing) reportPlayback(request.pending);
+            }
+        }
+    })();
+    return request.promise;
+}
+function reportPlayback(state) {
+    if (VIDEO_ONLY || (audioOutput && audioOutput.context.state !== 'running')) return Promise.resolve();
+    return syncPlayback(state);
+}
+async function seekPlayback(position) {
+    const id = currentItemId;
+    const sentAt = Date.now();
+    try {
+        const res = await fetch(`/api/channels/${encodeURIComponent(CHANNEL)}/playback/seek`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playbackId: id, position })
+        });
+        const data = await res.json();
+        if (id !== currentItemId) return;
+        if (!res.ok) throw new Error(data.error || 'Sign in to the dashboard to seek shared playback.');
+        acceptPlaybackState(data.playback, sentAt);
+        if (!audioPaused && !audioEl.paused) reportPlayback(mediaBuffering ? 'waiting' : 'playing');
+    } catch (err) { if (id === currentItemId) showPlaybackMessage(err.message, true); }
 }
 
 function applyAudioSettings(settings) {
@@ -258,7 +372,7 @@ if (CONTROLS) {
         isSeeking = false;
         const duration = getPlaybackDuration();
         if (!duration || !usesNativeAudio()) return;
-        try { audioEl.currentTime = seekBar.value / 100 * duration; }
+        try { audioEl.currentTime = seekBar.value / 100 * duration; return seekPlayback(audioEl.currentTime); }
         catch { showPlaybackMessage('This part of the audio has not loaded yet.'); }
     });
     volumeBar.addEventListener('input', () => { applyVolume(volumeBar.value); saveAudioSettings({ volume: volumePercent }); });
@@ -272,19 +386,29 @@ if (CONTROLS) {
     });
 }
 applyVolume();
-audioEl.addEventListener('ended', () => { if (usesNativeAudio() && !audioPaused) advance(); });
+audioEl.addEventListener('ended', () => { if (!VIDEO_ONLY && usesNativeAudio() && !audioPaused) advance(); });
 audioEl.addEventListener('error', () => { if (audioEl.src && usesNativeAudio()) nativeAudioFailed(); });
 audioEl.addEventListener('playing', () => {
     if (audioPaused) { audioEl.pause(); return; }
     if (usesNativeAudio()) {
+        mediaBuffering = false;
+        reportPlayback('playing');
         if (!audioOutput || audioOutput.context.state === 'running') showPlaybackMessage('');
         startPoll();
     }
 });
-['timeupdate', 'durationchange', 'loadedmetadata', 'seeked', 'progress'].forEach(event => audioEl.addEventListener(event, updateProgress));
+['timeupdate', 'durationchange', 'seeked', 'progress'].forEach(event => audioEl.addEventListener(event, updateProgress));
+audioEl.addEventListener('loadedmetadata', () => { followPlaybackClock(true); updateProgress(); });
+const reportBuffering = () => { mediaBuffering = true; reportPlayback('waiting'); };
+audioEl.addEventListener('waiting', reportBuffering);
+audioEl.addEventListener('stalled', () => { if (audioEl.readyState < 3) reportBuffering(); });
+audioEl.addEventListener('volumechange', () => { if (VIDEO_ONLY) { audioEl.muted = true; audioEl.volume = 0; } });
 
 function stopAudio() {
     try { audioEl.pause(); audioEl.removeAttribute('src'); audioEl.load(); } catch {}
+    audioEl.playbackRate = 1;
+    mediaBuffering = false;
+    pendingClockSeek = false;
 }
 function cancelPreparation() {
     preparationSequence++;
@@ -296,7 +420,7 @@ function showIdle() {
     cancelPreparation();
     playbackMode = null;
     isSeeking = false;
-    idleScreen.style.display = 'flex';
+    idleScreen.style.display = VIDEO_ONLY ? 'none' : 'flex';
     audioCard.hidden = true;
     audioEl.hidden = true;
     spotifyFrame.style.display = 'none';
@@ -304,6 +428,8 @@ function showIdle() {
     stopAudio();
     currentItemId = null;
     currentMediaItem = null;
+    playbackState = null;
+    appliedSeekVersion = -1;
     trackDuration = 0;
     showPlaybackMessage('');
     stopPoll();
@@ -322,6 +448,7 @@ async function prepareYouTubeMedia(videoId, itemId, retry = false, sequence = pr
         if (!stillCurrent()) return;
         if (data.status === 'failed' && data.code === 'YOUTUBE_UNAVAILABLE') {
             preparingYouTube = false;
+            if (VIDEO_ONLY) return;
             showPlaybackMessage('Skipping unavailable video…');
             return advance({ mediaType, videoId });
         }
@@ -339,6 +466,7 @@ async function prepareYouTubeMedia(videoId, itemId, retry = false, sequence = pr
         showPlaybackMessage('');
         audioEl.src = `/api/yt-${mediaType}/${encodeURIComponent(videoId)}`;
         applyVolume();
+        followPlaybackClock(true, false);
         startNativeAudio();
         startPoll();
         updateProgress();
@@ -348,7 +476,7 @@ async function prepareYouTubeMedia(videoId, itemId, retry = false, sequence = pr
         showPlaybackMessage(err.message || 'Could not prepare this song. Retry playback or skip it.', true);
     }
 }
-function playNative(item, source, mode) {
+function playNative(item, source, mode, clock) {
     playbackMode = mode;
     isSeeking = false;
     trackDuration = Number.isFinite(item.duration) && item.duration > 0 ? item.duration : 0;
@@ -358,16 +486,18 @@ function playNative(item, source, mode) {
     audioCard.hidden = !CONTROLS || mode === 'youtube-video';
     audioTitle.textContent = item.song_name || item.title || (mode === 'local' ? 'Local audio' : 'YouTube audio');
     if (seekBar) { seekBar.value = 0; seekBar.disabled = !trackDuration; }
+    acceptPlaybackState(clock);
     applyVolume();
-    if (source) { audioEl.src = source; startNativeAudio(); }
+    if (source) { audioEl.src = source; followPlaybackClock(true, false); startNativeAudio(); }
     startPoll();
 }
-function playItem(item, { retry = false } = {}) {
+function playItem(item, { retry = false, playback } = {}) {
     if (!item) { showIdle(); return; }
     const url = item.url || item.media || '';
     const platform = (item.platform || item.Platform || '').toLowerCase();
     const id = item._playbackId || item.id || `${platform}|${url}|${item.song_name || ''}|${item.username || ''}`;
-    if (id === currentItemId) return;
+    if (VIDEO_ONLY && (item._source !== 'requests' || !getYouTubeId(url))) { showIdle(); return; }
+    if (id === currentItemId) { acceptPlaybackState(playback); return; }
     if (id === skipItemId || id === finishedItemId) { showIdle(); return; }
     cancelPreparation();
     stopAudio();
@@ -378,16 +508,18 @@ function playItem(item, { retry = false } = {}) {
     skipItemId = null;
     currentItemId = id;
     currentMediaItem = item;
+    playbackState = null;
+    appliedSeekVersion = -1;
     if (platform === 'local' || /(\/|%2F)api(\/|%2F)local-media(\/|%2F)/.test(url)) {
         const cleanUrl = /^%2fapi%2flocal-media%2f/i.test(url) ? decodeURIComponent(url) : url;
-        playNative(item, cleanUrl, 'local');
+        playNative(item, cleanUrl, 'local', playback);
         return;
     }
     const videoId = getYouTubeId(url);
     if (videoId) {
         // The server labels viewer requests explicitly. Personal songs never
         // reveal video, even if they happen to use the same YouTube ID.
-        playNative(item, null, item._source === 'requests' ? 'youtube-video' : 'youtube-audio');
+        playNative(item, null, item._source === 'requests' ? 'youtube-video' : 'youtube-audio', playback);
         return prepareYouTubeMedia(videoId, id, retry);
     }
     const spotify = getSpotifyInfo(url);
@@ -406,7 +538,7 @@ function playItem(item, { retry = false } = {}) {
 }
 
 async function advance(unavailable = null) {
-    if (!CHANNEL || advancing) return;
+    if (VIDEO_ONLY || !CHANNEL || advancing) return;
     advancing = true;
     const playbackId = currentItemId;
     currentFetchSequence++;
@@ -433,12 +565,12 @@ async function fetchAndPlay() {
     if (advancing) return;
     const sequence = ++currentFetchSequence;
     try {
-        const res = await fetch(`/api/channels/${encodeURIComponent(CHANNEL)}/current`);
+        const res = await fetch(`/api/channels/${encodeURIComponent(CHANNEL)}/current${VIDEO_ONLY ? '?observe=1' : ''}`);
         if (!res.ok) throw new Error(res.status);
         const data = await res.json();
         if (sequence !== currentFetchSequence || advancing) return;
         if (!data.current) finishedItemId = null;
-        await playItem(data.current);
+        await playItem(data.current, { playback: data.playback });
     } catch (err) {
         if (sequence !== currentFetchSequence || advancing) return;
         console.error('Failed to fetch current item', err);
@@ -456,6 +588,7 @@ async function requestWakeLock() {
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
         if (!wakeLock) requestWakeLock();
+        syncPlayback();
         if (usesNativeAudio() && audioEl.src && !audioPaused) startNativeAudio();
     }
 });
@@ -465,9 +598,11 @@ document.addEventListener('visibilitychange', () => {
 }, { passive: true }));
 if (CHANNEL) {
     const socket = io();
-    socket.on('connect', () => { socket.emit('join:channel', CHANNEL); loadSavedAudioSettings(); });
+    socket.on('connect', () => { socket.emit('join:channel', CHANNEL); loadSavedAudioSettings(); syncPlayback(); });
     socket.on('queue:update', (payload = {}) => { if (!payload.channel || payload.channel === CHANNEL) fetchAndPlay(); });
     socket.on('audio:settings', ({ channel, settings, revision }) => { if (channel === CHANNEL) acceptAudioSettings(settings, revision); });
+    socket.on('playback:sync', state => { if (state?.channel === CHANNEL) acceptPlaybackState(state); });
+    setInterval(syncPlayback, 2000);
     setInterval(() => { if (!advancing) { fetchAndPlay(); loadSavedAudioSettings(); } }, 10000);
     requestWakeLock();
 }
