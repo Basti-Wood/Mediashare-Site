@@ -14,7 +14,11 @@ function upcomingMedia({ queue, personal, mode, isOwner, count = 3 }) {
         if (preferMine) {
             item = mine.shift();
             if (mode.mylistLoop && !item._playNext) mine.push(item);
-        } else item = requests.shift();
+            item = { ...item, _source: 'mylist' };
+        } else {
+            item = requests.shift();
+            if (item) item = { ...item, _source: isOwner(item) ? 'mylist' : 'requests' };
+        }
         if (!item) break;
         upcoming.push(item);
         if (mode.mode === 'switch') turn = turn === 'mylist' ? 'requests' : 'mylist';

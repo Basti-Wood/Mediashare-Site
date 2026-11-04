@@ -45,9 +45,9 @@ const volumeBar = CONTROLS ? document.getElementById('volume-bar') : null;
 const volumeInput = CONTROLS ? document.getElementById('volume-percent') : null;
 const timeDisplay = CONTROLS ? document.getElementById('time-display') : null;
 
-// YouTube and local MP3s have one playback clock and one output. Every URL fed
-// to this element is same-origin: YouTube audio is prepared on our backend.
-const audioEl = new Audio();
+// A single native video element also plays audio-only files while hidden.
+// Its one clock and gain control all MP3s and requested videos together.
+const audioEl = document.getElementById('media-player');
 audioEl.preload = 'auto';
 audioEl.autoplay = false;
 let audioOutput = null;
@@ -95,12 +95,12 @@ function showPlaybackMessage(message, error = false, preparing = false) {
     playbackMessage.textContent = message;
     playbackRetryBtn.hidden = preparing;
 }
-function usesNativeAudio() { return playbackMode === 'youtube-audio' || playbackMode === 'local'; }
+function usesNativeAudio() { return playbackMode === 'youtube-audio' || playbackMode === 'youtube-video' || playbackMode === 'local'; }
 function nativeAudioFailed() {
     if (!currentMediaItem || !usesNativeAudio()) return;
     stopAudio();
-    showPlaybackMessage(playbackMode === 'youtube-audio'
-        ? 'YouTube audio could not be loaded. Retry playback or skip this song.'
+    showPlaybackMessage(playbackMode.startsWith('youtube-')
+        ? `YouTube ${playbackMode === 'youtube-video' ? 'video' : 'audio'} could not be loaded. Retry playback or skip this song.`
         : 'This MP3 could not be loaded. Retry playback or skip this song.', true);
 }
 function startNativeAudio() {
@@ -298,6 +298,7 @@ function showIdle() {
     isSeeking = false;
     idleScreen.style.display = 'flex';
     audioCard.hidden = true;
+    audioEl.hidden = true;
     spotifyFrame.style.display = 'none';
     spotifyFrame.src = '';
     stopAudio();
@@ -309,28 +310,34 @@ function showIdle() {
     if (seekBar) { seekBar.value = 0; seekBar.disabled = true; }
     if (timeDisplay) timeDisplay.textContent = '0:00 / 0:00';
 }
-async function prepareYouTubeAudio(videoId, itemId, retry = false, sequence = preparationSequence) {
-    const stillCurrent = () => sequence === preparationSequence && itemId === currentItemId && playbackMode === 'youtube-audio';
+async function prepareYouTubeMedia(videoId, itemId, retry = false, sequence = preparationSequence) {
+    const mediaType = playbackMode === 'youtube-video' ? 'video' : 'audio';
+    const stillCurrent = () => sequence === preparationSequence && itemId === currentItemId && playbackMode === 'youtube-' + mediaType;
     if (!stillCurrent()) return;
     preparingYouTube = true;
-    showPlaybackMessage('Preparing YouTube audio…', false, true);
+    showPlaybackMessage(`Preparing YouTube ${mediaType}…`, false, true);
     try {
-        const res = await fetch(`/api/yt-audio/${encodeURIComponent(videoId)}/info${retry ? '?retry=1' : ''}`);
+        const res = await fetch(`/api/yt-${mediaType}/${encodeURIComponent(videoId)}/info${retry ? '?retry=1' : ''}`);
         const data = await res.json();
         if (!stillCurrent()) return;
+        if (data.status === 'failed' && data.code === 'YOUTUBE_UNAVAILABLE') {
+            preparingYouTube = false;
+            showPlaybackMessage('Skipping unavailable video…');
+            return advance({ mediaType, videoId });
+        }
         if (!res.ok || data.status === 'failed') throw new Error(data.error || 'The server could not prepare this song. Retry playback or skip it.');
         if (res.status === 202 || data.status === 'preparing') {
-            const message = data.stage === 'downloading' ? 'Downloading YouTube audio…'
-                : data.stage === 'queued' ? 'Waiting to download this song…' : 'Preparing and checking audio…';
+            const message = data.stage === 'downloading' ? `Downloading YouTube ${mediaType}…`
+                : data.stage === 'queued' ? 'Waiting to download this song…' : `Preparing and checking ${mediaType}…`;
             showPlaybackMessage(message, false, true);
-            preparationTimer = setTimeout(() => prepareYouTubeAudio(videoId, itemId, false, sequence),
+            preparationTimer = setTimeout(() => prepareYouTubeMedia(videoId, itemId, false, sequence),
                 Math.max(500, Math.min(5000, Number(data.retryAfterMs) || 1000)));
             return;
         }
         if (Number.isFinite(data.duration) && data.duration > 0) trackDuration = data.duration;
         preparingYouTube = false;
         showPlaybackMessage('');
-        audioEl.src = `/api/yt-audio/${encodeURIComponent(videoId)}`;
+        audioEl.src = `/api/yt-${mediaType}/${encodeURIComponent(videoId)}`;
         applyVolume();
         startNativeAudio();
         startPoll();
@@ -347,7 +354,8 @@ function playNative(item, source, mode) {
     trackDuration = Number.isFinite(item.duration) && item.duration > 0 ? item.duration : 0;
     idleScreen.style.display = 'none';
     spotifyFrame.style.display = 'none';
-    audioCard.hidden = !CONTROLS;
+    audioEl.hidden = mode !== 'youtube-video';
+    audioCard.hidden = !CONTROLS || mode === 'youtube-video';
     audioTitle.textContent = item.song_name || item.title || (mode === 'local' ? 'Local audio' : 'YouTube audio');
     if (seekBar) { seekBar.value = 0; seekBar.disabled = !trackDuration; }
     applyVolume();
@@ -365,6 +373,7 @@ function playItem(item, { retry = false } = {}) {
     stopAudio();
     stopPoll();
     spotifyFrame.src = '';
+    audioEl.hidden = true;
     showPlaybackMessage('');
     skipItemId = null;
     currentItemId = id;
@@ -376,8 +385,10 @@ function playItem(item, { retry = false } = {}) {
     }
     const videoId = getYouTubeId(url);
     if (videoId) {
-        playNative(item, null, 'youtube-audio');
-        return prepareYouTubeAudio(videoId, id, retry);
+        // The server labels viewer requests explicitly. Personal songs never
+        // reveal video, even if they happen to use the same YouTube ID.
+        playNative(item, null, item._source === 'requests' ? 'youtube-video' : 'youtube-audio');
+        return prepareYouTubeMedia(videoId, id, retry);
     }
     const spotify = getSpotifyInfo(url);
     if (spotify) {
@@ -394,7 +405,7 @@ function playItem(item, { retry = false } = {}) {
     showPlaybackMessage('This media link cannot be played. Retry playback or skip this song.', true);
 }
 
-async function advance() {
+async function advance(unavailable = null) {
     if (!CHANNEL || advancing) return;
     advancing = true;
     const playbackId = currentItemId;
@@ -404,9 +415,13 @@ async function advance() {
     showIdle();
     try {
         const res = await fetch(`/api/channels/${encodeURIComponent(CHANNEL)}/next`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playbackId })
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playbackId, ...(unavailable ? { unavailable } : {}) })
         });
         if (!res.ok) throw new Error(res.status);
+        if (unavailable && !(await res.json()).advanced) {
+            skipItemId = null;
+            finishedItemId = null;
+        }
     } catch (err) {
         console.error('Failed to advance queue', err);
         skipItemId = null;

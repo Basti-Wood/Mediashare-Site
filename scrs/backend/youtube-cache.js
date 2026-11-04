@@ -12,16 +12,20 @@ const FORMATS = [
     'bestaudio[ext=m4a]/bestaudio/best',
     'best[ext=mp4][height<=480]/best[acodec!=none][height<=480]/best[acodec!=none]'
 ];
+const VIDEO_FORMATS = [
+    'best[ext=mp4][height<=720]/best[height<=720]',
+    'bestvideo[height<=720]+bestaudio/best[height<=720]'
+];
 
 function publicFailure(err) {
     if (err.code === 'ENOENT') return error('DEPENDENCY_MISSING', 'The server is missing a media tool. Rebuild the Docker image to install yt-dlp, ffmpeg and ffprobe.');
     if (err.code && err.status) return err;
     const detail = String(err.message || err);
     if (/private video|video (is )?unavailable|this video is not available|has been removed|copyright|members.only|age.restricted/i.test(detail))
-        return error('YOUTUBE_UNAVAILABLE', 'YouTube refused this video or it is unavailable to this server. Retry later or skip this song.');
+        return error('YOUTUBE_UNAVAILABLE', 'This YouTube video is private, removed or unavailable.');
     if (/429|too many requests/i.test(detail)) return error('YOUTUBE_RATE_LIMIT', 'YouTube is rate-limiting this server. Wait a little and retry.');
     if (/sign in|confirm.*bot|403/i.test(detail)) return error('YOUTUBE_ACCESS', 'YouTube refused this download. Retry later or skip this song.');
-    if (/max.*file.*size|larger than|too large/i.test(detail)) return error('MEDIA_TOO_LARGE', 'This video exceeds the temporary audio cache limit.');
+    if (/max.*file.*size|larger than|too large/i.test(detail)) return error('MEDIA_TOO_LARGE', 'This video exceeds the temporary media cache limit.');
     if (/does not pass filter|is_live/i.test(detail)) return error('LIVE_STREAM', 'Live streams cannot be prepared as complete temporary songs.');
     if (/invalid data|decod|invalid audio/i.test(detail)) return error('INVALID_MEDIA', 'The downloaded song could not be decoded completely. Retry playback or skip it.');
     return error('PREPARATION_FAILED', 'The server could not download and prepare this song. Retry playback or skip it.');
@@ -32,7 +36,10 @@ function publicFailure(err) {
 function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
     maxBytes = 1024 * MIB, maxEntryBytes = 128 * MIB, ttlMs = 6 * 60 * 60 * 1000,
     downloadTimeoutMs = 180000, processTimeoutMs = 120000, concurrency = 2,
-    loudnorm = 'loudnorm=I=-14:TP=-1.5:LRA=11', onError = () => {} } = {}) {
+    loudnorm = 'loudnorm=I=-14:TP=-1.5:LRA=11', mediaType = 'audio', onError = () => {} } = {}) {
+    const video = mediaType === 'video';
+    const extension = video ? 'mp4' : 'mp3';
+    const formats = video ? VIDEO_FORMATS : FORMATS;
     root = path.resolve(root);
     const entries = new Map();
     const jobs = new Map();
@@ -45,7 +52,7 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
     let order = 0;
     fs.mkdirSync(stageRoot, { recursive: true });
 
-    const fileFor = id => path.join(root, id + '.mp3');
+    const fileFor = id => path.join(root, id + '.' + extension);
     const metaFor = id => path.join(root, id + '.json');
     const validId = id => { if (!ID.test(id || '')) throw error('INVALID_ID', 'Invalid YouTube video ID.', 400); };
     const referenced = id => [...plans.values()].some(plan => plan.expires > now() && plan.ids.includes(id));
@@ -89,7 +96,7 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
             remove(entry.id);
             bytes -= entry.bytes;
         }
-        if (bytes + extra > maxBytes) throw error('CACHE_FULL', 'The temporary audio cache is full. Let the current downloads finish and retry.', 503);
+        if (bytes + extra > maxBytes) throw error('CACHE_FULL', 'The temporary media cache is full. Let the current downloads finish and retry.', 503);
     }
 
     // Recover completed files after restart; discard abandoned/incomplete pairs.
@@ -106,7 +113,7 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
         } catch { remove(id); }
     }
     for (const name of fs.readdirSync(root)) {
-        if (/^[A-Za-z0-9_-]{11}\.mp3$/.test(name) && !entries.has(name.slice(0, -4))) fs.rmSync(path.join(root, name), { force: true });
+        if (new RegExp('^[A-Za-z0-9_-]{11}\\.' + extension + '$').test(name) && !entries.has(name.slice(0, -4))) fs.rmSync(path.join(root, name), { force: true });
     }
     for (const name of fs.readdirSync(stageRoot)) {
         fs.rmSync(path.join(stageRoot, name), { recursive: true, force: true });
@@ -149,7 +156,7 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
             const sizeCheck = setInterval(() => {
                 try {
                     const size = fs.readdirSync(job.stage).reduce((sum, name) => sum + fs.lstatSync(path.join(job.stage, name)).size, 0);
-                    if (size > maxEntryBytes * 2 + MIB) { failure = error('MEDIA_TOO_LARGE', 'This video exceeds the temporary audio cache limit.'); child.kill('SIGKILL'); }
+                    if (size > maxEntryBytes * 2 + MIB) { failure = error('MEDIA_TOO_LARGE', 'This video exceeds the temporary media cache limit.'); child.kill('SIGKILL'); }
                 } catch { /* A download may be between temporary-file renames. */ }
             }, 250);
             sizeCheck.unref();
@@ -178,16 +185,18 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
         let data;
         try { data = JSON.parse(raw); } catch { throw error('INVALID_MEDIA', 'The downloaded song has no readable audio.'); }
         const audio = data.streams?.find(stream => stream.codec_type === 'audio');
+        const picture = data.streams?.find(stream => stream.codec_type === 'video');
         const duration = Number(data.format?.duration || audio?.duration);
         if (!audio || !Number.isFinite(duration) || duration <= 0) throw error('INVALID_MEDIA', 'The downloaded song has no complete audio track.');
-        return { duration, codec: audio.codec_name };
+        if (video && !picture) throw error('INVALID_MEDIA', 'The downloaded file has no video track.');
+        return { duration, codec: audio.codec_name, videoCodec: picture?.codec_name };
     }
     async function work(job) {
         job.stage = path.join(stageRoot, randomUUID());
         let lastError;
         try {
             fs.mkdirSync(job.stage, { recursive: true });
-            for (let attempt = 0; attempt < FORMATS.length; attempt++) {
+            for (let attempt = 0; attempt < formats.length; attempt++) {
                 if (job.cancelled) throw job.cancelled;
                 for (const name of fs.readdirSync(job.stage)) fs.rmSync(path.join(job.stage, name), { recursive: true, force: true });
                 try {
@@ -198,7 +207,7 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
                         '--abort-on-unavailable-fragments', '--retry-sleep', 'fragment:exp=1:4',
                         '--retry-sleep', 'http:exp=1:4', '--concurrent-fragments', '2', '--match-filters', '!is_live',
                         '--max-filesize', String(maxEntryBytes), '--cache-dir', path.join(root, '.extractor'),
-                        '--format', FORMATS[attempt], '--output', path.join(job.stage, 'source.%(ext)s'),
+                        '--format', formats[attempt], '--output', path.join(job.stage, 'source.%(ext)s'),
                         '--', `https://www.youtube.com/watch?v=${job.id}`
                     ], downloadTimeoutMs);
                     const name = fs.readdirSync(job.stage).find(name => /^source\.[a-z0-9]+$/i.test(name) && !name.endsWith('.part') && !name.endsWith('.ytdl'));
@@ -206,20 +215,25 @@ function createYouTubeCache({ root, spawn = defaultSpawn, now = Date.now,
                     const source = path.join(job.stage, name);
                     const sourceStat = fs.lstatSync(source);
                     if (!sourceStat.isFile() || !sourceStat.size) throw error('INVALID_MEDIA', 'The downloaded file is empty.');
-                    if (sourceStat.size > maxEntryBytes) throw error('MEDIA_TOO_LARGE', 'This video exceeds the temporary audio cache limit.');
+                    if (sourceStat.size > maxEntryBytes) throw error('MEDIA_TOO_LARGE', 'This video exceeds the temporary media cache limit.');
                     const original = await probe(job, source);
                     job.state = 'converting';
-                    const output = path.join(job.stage, 'ready.mp3');
+                    const output = path.join(job.stage, 'ready.' + extension);
                     await run(job, 'ffmpeg', ['-v', 'error', '-xerror', '-nostdin', '-y', '-protocol_whitelist', 'file,pipe',
-                        '-i', source, '-vn', '-af', loudnorm, '-codec:a', 'libmp3lame', '-b:a', '192k',
+                        '-i', source, ...(video ? ['-map', '0:v:0', '-map', '0:a:0',
+                            '-vf', 'scale=w=min(1280\\,iw):h=min(720\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2',
+                            '-codec:v', 'libx264', '-threads:v', '2', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
+                            '-movflags', '+faststart'] : ['-vn']),
+                        '-af', loudnorm, '-codec:a', video ? 'aac' : 'libmp3lame', '-b:a', '192k',
                         '-fs', String(maxEntryBytes + 1), output]);
                     const size = fs.lstatSync(output).size;
-                    if (!size) throw error('INVALID_MEDIA', 'The prepared audio file was empty.');
-                    if (size > maxEntryBytes) throw error('MEDIA_TOO_LARGE', 'This video exceeds the temporary audio cache limit.');
+                    if (!size) throw error('INVALID_MEDIA', 'The prepared media file was empty.');
+                    if (size > maxEntryBytes) throw error('MEDIA_TOO_LARGE', 'This video exceeds the temporary media cache limit.');
                     job.state = 'checking';
                     const normalized = await probe(job, output);
-                    if (normalized.codec !== 'mp3' || Math.abs(normalized.duration - original.duration) > Math.max(2, original.duration * 0.01))
-                        throw error('INVALID_MEDIA', 'The prepared audio was incomplete.');
+                    if (normalized.codec !== (video ? 'aac' : 'mp3') || (video && normalized.videoCodec !== 'h264')
+                        || Math.abs(normalized.duration - original.duration) > Math.max(2, original.duration * 0.01))
+                        throw error('INVALID_MEDIA', 'The prepared media was incomplete or in an unsupported format.');
                     // Decode the whole file before publishing it, including any
                     // malformed/truncated final frames that metadata can miss.
                     await run(job, 'ffmpeg', ['-v', 'error', '-xerror', '-nostdin', '-protocol_whitelist', 'file,pipe', '-i', output, '-f', 'null', '-']);

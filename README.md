@@ -98,50 +98,57 @@ known filename for the current song.
 Metadata lookup and temporary YouTube downloads use `yt-dlp`; `ffmpeg` normalizes
 uploaded MP3s and prepared audio. `ffprobe` checks the downloaded and normalized
 files. The Docker image includes these tools and Node 24. Refresh the dashboard and OBS browser source after updating; both
-scripts are versioned `audio-cache-1`.
+scripts are versioned `request-video-1`.
 
-## If songs immediately skip or audio returns 502
+## Playback errors and unavailable videos
 
-Audio loading failures keep the current song queued and show **Play / Retry**
-and **Skip this song**. Only a completed song or an explicit Skip advances the
-queue. YouTube playback is audio-only through the same native audio output as
-uploaded MP3s; no YouTube video widget, iframe API or iframe fallback is loaded.
-Autoplay permission failures ask for a click.
+Confirmed private, removed or unavailable YouTube videos are skipped automatically,
+for both viewer requests and personal songs. A skipped unavailable track is
+retired from the active personal queue so Loop cannot get stuck repeating it;
+saved playlist snapshots remain available. The server verifies the current
+playback ID and the actual download failure before advancing, so simultaneous
+players cannot skip an extra song. Network errors, rate limits, missing server
+tools and autoplay permission failures keep the current song queued and show
+**Play / Retry** and **Skip this song**.
 
-## Temporary YouTube audio and preloading
+## Temporary YouTube media and preloading
 
-The player downloads each YouTube song to the server before playing it. It tries
-an audio-only source first; if that fails, it tries a combined MP4/video source
-and extracts its audio. Downloads get bounded retries. The server checks the
-complete file, normalizes it to MP3 and verifies its duration and decoding before
-making it playable. The dashboard shows **Downloading** or **Preparing**, with a
-Skip button. No video widget is displayed and no MP4 is downloaded to your PC.
+Viewer-requested YouTube songs play with **video and sound** from a complete,
+temporary MP4 on the server. The native player shows the video in the dashboard,
+pop-out and OBS overlay, without a YouTube widget. Output is compatible H.264
+video (up to 1280×720) with normalized AAC audio and seeking support. If a combined
+video source fails, the server tries separate video/audio streams and merges
+them. Completed files are probed and decoded before they can play.
+
+Personal songs in **My List**, saved playlists loaded into My List and uploaded
+MP3s remain **audio-only**. Their video stays hidden even if a viewer requested
+the same YouTube ID earlier. Personal YouTube songs use an audio-only download
+first, with a combined MP4 source as a fallback for extracting audio. Files stay
+on the server rather than downloading to your computer. Dashboard and OBS share
+completed files and download jobs within each cache.
 
 While the current song plays, the server prepares the next **three tracks** in
-queue order, including My List, alternating mode, loop and Play next uploads.
-This does not advance the queue. Local MP3s already have files and need no extra
-download. Dashboard and OBS share completed files and download jobs, so a song
-is downloaded once, rather than streamed separately for each player. Preparing
-new current songs takes priority over background downloads.
+queue order, including alternating mode, Loop and Play next uploads. Viewer
+requests warm the video cache; personal songs warm the audio cache; local MP3s
+already have files. This never consumes or reorders songs. The player shows
+**Downloading** or **Preparing** until its complete file is ready. Its first
+song can take time to prepare; later cached songs start promptly.
 
-Temporary MP3s live in `./data/youtube-cache`, separate from uploaded files and
-saved playlists. By default completed files use at most **1 GB**, each source
-and prepared file is limited to **128 MB**, and idle files expire after **six
-hours**. Old files are evicted first; files currently being served or played are
-protected. Two jobs may run concurrently, each also using bounded temporary
-working space. Unneeded pending downloads are cancelled when a channel's plan
-changes or its players disconnect/stop polling. Completed cache files survive
-container restarts. Uploaded files and playlist snapshots are never deleted by
-cache cleanup.
+Temporary audio lives in `./data/youtube-cache` and requested videos in
+`./data/youtube-video-cache`, separate from uploaded files and saved playlists.
+Each cache uses at most **1 GB** by default (**2 GB combined**), excluding bounded
+working space for active jobs. Individual source/output limits are **128 MB**
+for audio and **256 MB** for video. Idle files expire after **six hours**; old
+files are evicted first and current/served files are protected. Each cache runs
+at most two jobs, prioritizing current playback. Obsolete pending jobs are
+cancelled after queue changes or when players stop polling. Completed files
+survive container restarts. Cleanup never deletes uploaded MP3s or saved playlists.
 
 Configure `YOUTUBE_CACHE_MAX_MB`, `YOUTUBE_CACHE_ENTRY_MB`,
+`YOUTUBE_VIDEO_CACHE_MAX_MB`, `YOUTUBE_VIDEO_CACHE_ENTRY_MB`,
 `YOUTUBE_CACHE_TTL_HOURS`, `YOUTUBE_PREFETCH_COUNT` (0–10; 0 disables lookahead)
-and `YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS` in the container environment. A first
-song can take time to download and normalize; later cached songs start promptly.
-Private, removed, age/region restricted, live or oversized videos, and videos
-YouTube refuses to serve to your server cannot be guaranteed playable. Failures
-show an actionable error and keep the song queued. **Play / Retry** starts a new
-attempt; other clients reuse failures for one minute to avoid retry storms.
+and `YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS` in the container environment. Live streams,
+oversized videos and temporary server-wide YouTube blocks still show Retry/Skip.
 Rebuild Docker with `--no-cache` to refresh yt-dlp when YouTube changes.
 
 ## Saved volume and shared Pause/Resume
@@ -153,13 +160,13 @@ dashboard, the audio controls or Stream Deck. A saved volume of **0.5%** maps to
 linear signal gain **0.005**, half the gain of **1%** (**0.01**). The old hidden
 50% output cap is removed. Decimal dots and commas work in the percentage field;
 the dial display preserves fractional values and its step can be set to 0.5%.
-A short 5 ms gain ramp avoids clicks when changing volume. YouTube audio and MP3s
+A short 5 ms gain ramp avoids clicks when changing volume. Requested videos, personal YouTube audio and MP3s
 share this output; Spotify embeds retain their own volume controls.
 
 Versioned settings keep Stream Deck, dashboard and OBS in sync even during local
 saves: a pending volume save does not discard Pause, and older acknowledgements
 cannot overwrite newer settings. Song duration comes from cached audio metadata,
-without a YouTube video player.
+without loading the YouTube iframe API.
 
 Change settings from a signed-in dashboard or pop-out. OBS can read and follow
 the saved settings without logging in. Each channel's preferences are separate;
@@ -169,7 +176,7 @@ live in `./data/audio-settings` under the same persistent data mount as MP3s.
 If the Local Music playlist form is missing, verify that the feature pull request
 has been merged and that your deployment has pulled that revision. Refresh the
 dashboard and OBS browser source after updating. The updated overlay script is
-versioned `audio-cache-1`.
+versioned `request-video-1`.
 
 ## Update an existing Docker installation
 

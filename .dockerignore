@@ -15,3 +15,4 @@ tests/.tmp-*/
 data/streamdeck/
 
 data/youtube-cache/
+data/youtube-video-cache/
